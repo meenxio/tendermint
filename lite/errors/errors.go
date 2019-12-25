@@ -3,7 +3,7 @@ package errors
 import (
 	"fmt"
 
-	cmn "github.com/tendermint/tendermint/libs/common"
+	"github.com/pkg/errors"
 )
 
 //----------------------------------------
@@ -25,12 +25,6 @@ func (e errUnexpectedValidators) Error() string {
 		e.got, e.want)
 }
 
-type errTooMuchChange struct{}
-
-func (e errTooMuchChange) Error() string {
-	return "Insufficient signatures to validate due to valset changes"
-}
-
 type errUnknownValidators struct {
 	chainID string
 	height  int64
@@ -41,6 +35,12 @@ func (e errUnknownValidators) Error() string {
 		e.chainID, e.height)
 }
 
+type errEmptyTree struct{}
+
+func (e errEmptyTree) Error() string {
+	return "Tree is empty"
+}
+
 //----------------------------------------
 // Methods for above error types
 
@@ -49,15 +49,12 @@ func (e errUnknownValidators) Error() string {
 
 // ErrCommitNotFound indicates that a the requested commit was not found.
 func ErrCommitNotFound() error {
-	return cmn.ErrorWrap(errCommitNotFound{}, "")
+	return errors.Wrap(errCommitNotFound{}, "")
 }
 
 func IsErrCommitNotFound(err error) bool {
-	if err_, ok := err.(cmn.Error); ok {
-		_, ok := err_.Data().(errCommitNotFound)
-		return ok
-	}
-	return false
+	_, ok := errors.Cause(err).(errCommitNotFound)
+	return ok
 }
 
 //-----------------
@@ -65,34 +62,15 @@ func IsErrCommitNotFound(err error) bool {
 
 // ErrUnexpectedValidators indicates a validator set mismatch.
 func ErrUnexpectedValidators(got, want []byte) error {
-	return cmn.ErrorWrap(errUnexpectedValidators{
+	return errors.Wrap(errUnexpectedValidators{
 		got:  got,
 		want: want,
 	}, "")
 }
 
 func IsErrUnexpectedValidators(err error) bool {
-	if err_, ok := err.(cmn.Error); ok {
-		_, ok := err_.Data().(errUnexpectedValidators)
-		return ok
-	}
-	return false
-}
-
-//-----------------
-// ErrTooMuchChange
-
-// ErrTooMuchChange indicates that the underlying validator set was changed by >1/3.
-func ErrTooMuchChange() error {
-	return cmn.ErrorWrap(errTooMuchChange{}, "")
-}
-
-func IsErrTooMuchChange(err error) bool {
-	if err_, ok := err.(cmn.Error); ok {
-		_, ok := err_.Data().(errTooMuchChange)
-		return ok
-	}
-	return false
+	_, ok := errors.Cause(err).(errUnexpectedValidators)
+	return ok
 }
 
 //-----------------
@@ -100,13 +78,22 @@ func IsErrTooMuchChange(err error) bool {
 
 // ErrUnknownValidators indicates that some validator set was missing or unknown.
 func ErrUnknownValidators(chainID string, height int64) error {
-	return cmn.ErrorWrap(errUnknownValidators{chainID, height}, "")
+	return errors.Wrap(errUnknownValidators{chainID, height}, "")
 }
 
 func IsErrUnknownValidators(err error) bool {
-	if err_, ok := err.(cmn.Error); ok {
-		_, ok := err_.Data().(errUnknownValidators)
-		return ok
-	}
-	return false
+	_, ok := errors.Cause(err).(errUnknownValidators)
+	return ok
+}
+
+//-----------------
+// ErrEmptyTree
+
+func ErrEmptyTree() error {
+	return errors.Wrap(errEmptyTree{}, "")
+}
+
+func IsErrEmptyTree(err error) bool {
+	_, ok := errors.Cause(err).(errEmptyTree)
+	return ok
 }

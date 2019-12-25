@@ -21,19 +21,38 @@ implementation.
 */
 
 import (
-	cmn "github.com/tendermint/tendermint/libs/common"
+	"context"
+
+	"github.com/tendermint/tendermint/libs/bytes"
+	"github.com/tendermint/tendermint/libs/service"
 	ctypes "github.com/tendermint/tendermint/rpc/core/types"
 	"github.com/tendermint/tendermint/types"
 )
 
-// ABCIClient groups together the functionality that principally
-// affects the ABCI app. In many cases this will be all we want,
-// so we can accept an interface which is easier to mock
+// Client wraps most important rpc calls a client would make if you want to
+// listen for events, test if it also implements events.EventSwitch.
+type Client interface {
+	service.Service
+	ABCIClient
+	EventsClient
+	HistoryClient
+	NetworkClient
+	SignClient
+	StatusClient
+	EvidenceClient
+	MempoolClient
+}
+
+// ABCIClient groups together the functionality that principally affects the
+// ABCI app.
+//
+// In many cases this will be all we want, so we can accept an interface which
+// is easier to mock.
 type ABCIClient interface {
 	// Reading from abci app
 	ABCIInfo() (*ctypes.ResultABCIInfo, error)
-	ABCIQuery(path string, data cmn.HexBytes) (*ctypes.ResultABCIQuery, error)
-	ABCIQueryWithOptions(path string, data cmn.HexBytes,
+	ABCIQuery(path string, data bytes.HexBytes) (*ctypes.ResultABCIQuery, error)
+	ABCIQueryWithOptions(path string, data bytes.HexBytes,
 		opts ABCIQueryOptions) (*ctypes.ResultABCIQuery, error)
 
 	// Writing to abci app
@@ -42,54 +61,63 @@ type ABCIClient interface {
 	BroadcastTxSync(tx types.Tx) (*ctypes.ResultBroadcastTx, error)
 }
 
-// SignClient groups together the interfaces need to get valid
-// signatures and prove anything about the chain
+// SignClient groups together the functionality needed to get valid signatures
+// and prove anything about the chain.
 type SignClient interface {
 	Block(height *int64) (*ctypes.ResultBlock, error)
 	BlockResults(height *int64) (*ctypes.ResultBlockResults, error)
 	Commit(height *int64) (*ctypes.ResultCommit, error)
-	Validators(height *int64) (*ctypes.ResultValidators, error)
+	Validators(height *int64, page, perPage int) (*ctypes.ResultValidators, error)
 	Tx(hash []byte, prove bool) (*ctypes.ResultTx, error)
 	TxSearch(query string, prove bool, page, perPage int) (*ctypes.ResultTxSearch, error)
 }
 
-// HistoryClient shows us data from genesis to now in large chunks.
+// HistoryClient provides access to data from genesis to now in large chunks.
 type HistoryClient interface {
 	Genesis() (*ctypes.ResultGenesis, error)
 	BlockchainInfo(minHeight, maxHeight int64) (*ctypes.ResultBlockchainInfo, error)
 }
 
+// StatusClient provides access to general chain info.
 type StatusClient interface {
-	// General chain info
 	Status() (*ctypes.ResultStatus, error)
 }
 
-// Client wraps most important rpc calls a client would make
-// if you want to listen for events, test if it also
-// implements events.EventSwitch
-type Client interface {
-	cmn.Service
-	ABCIClient
-	SignClient
-	HistoryClient
-	StatusClient
-	EventsClient
-}
-
-// NetworkClient is general info about the network state.  May not
-// be needed usually.
-//
-// Not included in the Client interface, but generally implemented
-// by concrete implementations.
+// NetworkClient is general info about the network state. May not be needed
+// usually.
 type NetworkClient interface {
 	NetInfo() (*ctypes.ResultNetInfo, error)
 	DumpConsensusState() (*ctypes.ResultDumpConsensusState, error)
 	ConsensusState() (*ctypes.ResultConsensusState, error)
+	ConsensusParams(height *int64) (*ctypes.ResultConsensusParams, error)
 	Health() (*ctypes.ResultHealth, error)
 }
 
 // EventsClient is reactive, you can subscribe to any message, given the proper
 // string. see tendermint/types/events.go
 type EventsClient interface {
-	types.EventBusSubscriber
+	// Subscribe subscribes given subscriber to query. Returns a channel with
+	// cap=1 onto which events are published. An error is returned if it fails to
+	// subscribe. outCapacity can be used optionally to set capacity for the
+	// channel. Channel is never closed to prevent accidental reads.
+	//
+	// ctx cannot be used to unsubscribe. To unsubscribe, use either Unsubscribe
+	// or UnsubscribeAll.
+	Subscribe(ctx context.Context, subscriber, query string, outCapacity ...int) (out <-chan ctypes.ResultEvent, err error)
+	// Unsubscribe unsubscribes given subscriber from query.
+	Unsubscribe(ctx context.Context, subscriber, query string) error
+	// UnsubscribeAll unsubscribes given subscriber from all the queries.
+	UnsubscribeAll(ctx context.Context, subscriber string) error
+}
+
+// MempoolClient shows us data about current mempool state.
+type MempoolClient interface {
+	UnconfirmedTxs(limit int) (*ctypes.ResultUnconfirmedTxs, error)
+	NumUnconfirmedTxs() (*ctypes.ResultUnconfirmedTxs, error)
+}
+
+// EvidenceClient is used for submitting an evidence of the malicious
+// behaviour.
+type EvidenceClient interface {
+	BroadcastEvidence(ev types.Evidence) (*ctypes.ResultBroadcastEvidence, error)
 }

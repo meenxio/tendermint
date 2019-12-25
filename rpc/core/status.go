@@ -4,67 +4,19 @@ import (
 	"bytes"
 	"time"
 
-	cmn "github.com/tendermint/tendermint/libs/common"
+	tmbytes "github.com/tendermint/tendermint/libs/bytes"
+	"github.com/tendermint/tendermint/p2p"
 	ctypes "github.com/tendermint/tendermint/rpc/core/types"
+	rpctypes "github.com/tendermint/tendermint/rpc/lib/types"
 	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/types"
 )
 
-// Get Tendermint status including node info, pubkey, latest block
+// Status returns Tendermint status including node info, pubkey, latest block
 // hash, app hash, block height and time.
-//
-// ```shell
-// curl 'localhost:26657/status'
-// ```
-//
-// ```go
-// client := client.NewHTTP("tcp://0.0.0.0:26657", "/websocket")
-// result, err := client.Status()
-// ```
-//
-// > The above command returns JSON structured like this:
-//
-// ```json
-// {
-// "jsonrpc": "2.0",
-// "id": "",
-// "result": {
-//   "node_info": {
-//   		"id": "53729852020041b956e86685e24394e0bee4373f",
-//   		"listen_addr": "10.0.2.15:26656",
-//   		"network": "test-chain-Y1OHx6",
-//   		"version": "0.24.0-2ce1abc2",
-//   		"channels": "4020212223303800",
-//   		"moniker": "ubuntu-xenial",
-//   		"other": {
-//   			"amino_version": "0.12.0",
-//   			"p2p_version": "0.5.0",
-//   			"consensus_version": "v1/0.2.2",
-//   			"rpc_version": "0.7.0/3",
-//   			"tx_index": "on",
-//   			"rpc_addr": "tcp://0.0.0.0:26657"
-//   		}
-//   	},
-//   	"sync_info": {
-//   		"latest_block_hash": "F51538DA498299F4C57AC8162AAFA0254CE08286",
-//   		"latest_app_hash": "0000000000000000",
-//   		"latest_block_height": "18",
-//   		"latest_block_time": "2018-09-17T11:42:19.149920551Z",
-//   		"catching_up": false
-//   	},
-//   	"validator_info": {
-//   		"address": "D9F56456D7C5793815D0E9AF07C3A355D0FC64FD",
-//   		"pub_key": {
-//   			"type": "tendermint/PubKeyEd25519",
-//   			"value": "wVxKNtEsJmR4vvh651LrVoRguPs+6yJJ9Bz174gw9DM="
-//   		},
-//   		"voting_power": "10"
-//   	}
-//   }
-// }
-// ```
-func Status() (*ctypes.ResultStatus, error) {
-	var latestHeight int64 = -1
+// More: https://tendermint.com/rpc/#/Info/status
+func Status(ctx *rpctypes.Context) (*ctypes.ResultStatus, error) {
+	var latestHeight int64
 	if consensusReactor.FastSync() {
 		latestHeight = blockStore.Height()
 	} else {
@@ -72,8 +24,8 @@ func Status() (*ctypes.ResultStatus, error) {
 	}
 	var (
 		latestBlockMeta     *types.BlockMeta
-		latestBlockHash     cmn.HexBytes
-		latestAppHash       cmn.HexBytes
+		latestBlockHash     tmbytes.HexBytes
+		latestAppHash       tmbytes.HexBytes
 		latestBlockTimeNano int64
 	)
 	if latestHeight != 0 {
@@ -91,7 +43,7 @@ func Status() (*ctypes.ResultStatus, error) {
 	}
 
 	result := &ctypes.ResultStatus{
-		NodeInfo: p2pTransport.NodeInfo(),
+		NodeInfo: p2pTransport.NodeInfo().(p2p.DefaultNodeInfo),
 		SyncInfo: ctypes.SyncInfo{
 			LatestBlockHash:   latestBlockHash,
 			LatestAppHash:     latestAppHash,

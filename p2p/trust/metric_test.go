@@ -26,7 +26,7 @@ func TestTrustMetricScores(t *testing.T) {
 func TestTrustMetricConfig(t *testing.T) {
 	// 7 days
 	window := time.Minute * 60 * 24 * 7
-	config := TrustMetricConfig{
+	config := MetricConfig{
 		TrackingWindow: window,
 		IntervalLength: 2 * time.Minute,
 	}
@@ -57,7 +57,7 @@ func TestTrustMetricConfig(t *testing.T) {
 }
 
 func TestTrustMetricCopyNilPointer(t *testing.T) {
-	var tm *TrustMetric
+	var tm *Metric
 
 	ctm := tm.Copy()
 
@@ -65,6 +65,7 @@ func TestTrustMetricCopyNilPointer(t *testing.T) {
 }
 
 // XXX: This test fails non-deterministically
+//nolint:unused,deadcode
 func _TestTrustMetricStopPause(t *testing.T) {
 	// The TestTicker will provide manual control over
 	// the passing of time within the metric

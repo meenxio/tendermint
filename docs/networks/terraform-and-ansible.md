@@ -1,3 +1,7 @@
+---
+order: 3
+---
+
 # Terraform & Ansible
 
 Automated deployments are done using
@@ -8,7 +12,7 @@ testnets on those servers.
 ## Install
 
 NOTE: see the [integration bash
-script](https://github.com/tendermint/tendermint/blob/develop/networks/remote/integration.sh)
+script](https://github.com/tendermint/tendermint/blob/master/networks/remote/integration.sh)
 that can be run on a fresh DO droplet and will automatically spin up a 4
 node testnet. The script more or less does everything described below.
 
@@ -29,7 +33,7 @@ export SSH_KEY_FILE="$HOME/.ssh/id_rsa.pub"
 
 These will be used by both `terraform` and `ansible`.
 
-### Terraform
+## Terraform
 
 This step will create four Digital Ocean droplets. First, go to the
 correct directory:
@@ -49,7 +53,7 @@ and you will get a list of IP addresses that belong to your droplets.
 
 With the droplets created and running, let's setup Ansible.
 
-### Ansible
+## Ansible
 
 The playbooks in [the ansible
 directory](https://github.com/tendermint/tendermint/tree/master/networks/remote/ansible)
@@ -62,16 +66,18 @@ There are several roles that are self-explanatory:
 First, we configure our droplets by specifying the paths for tendermint
 (`BINARY`) and the node files (`CONFIGDIR`). The latter expects any
 number of directories named `node0, node1, ...` and so on (equal to the
-number of droplets created). For this example, we use pre-created files
-from [this
-directory](https://github.com/tendermint/tendermint/tree/master/docs/examples).
-To create your own files, use either the `tendermint testnet` command or
-review [manual deployments](./deploy-testnets.md).
+number of droplets created).
 
-Here's the command to run:
+To create the node files run:
 
 ```
-ansible-playbook -i inventory/digital_ocean.py -l sentrynet config.yml -e BINARY=$GOPATH/src/github.com/tendermint/tendermint/build/tendermint -e CONFIGDIR=$GOPATH/src/github.com/tendermint/tendermint/docs/examples
+tendermint testnet
+```
+
+Then, to configure our droplets run:
+
+```
+ansible-playbook -i inventory/digital_ocean.py -l sentrynet config.yml -e BINARY=$GOPATH/src/github.com/tendermint/tendermint/build/tendermint -e CONFIGDIR=$GOPATH/src/github.com/tendermint/tendermint/networks/remote/ansible/mytestnet
 ```
 
 Voila! All your droplets now have the `tendermint` binary and required
@@ -144,7 +150,7 @@ Peek at the logs with the status role:
 ansible-playbook -i inventory/digital_ocean.py -l sentrynet status.yml
 ```
 
-### Logging
+## Logging
 
 The crudest way is the status role described above. You can also ship
 logs to Logz.io, an Elastic stack (Elastic search, Logstash and Kibana)
@@ -160,7 +166,7 @@ go get github.com/mheese/journalbeat
 ansible-playbook -i inventory/digital_ocean.py -l sentrynet logzio.yml -e LOGZIO_TOKEN=ABCDEFGHIJKLMNOPQRSTUVWXYZ012345
 ```
 
-### Cleanup
+## Cleanup
 
 To remove your droplets, run:
 

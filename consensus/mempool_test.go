@@ -3,6 +3,7 @@ package consensus
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -10,53 +11,59 @@ import (
 
 	"github.com/tendermint/tendermint/abci/example/code"
 	abci "github.com/tendermint/tendermint/abci/types"
-
+	mempl "github.com/tendermint/tendermint/mempool"
+	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/types"
+	dbm "github.com/tendermint/tm-db"
 )
 
-func init() {
-	config = ResetConfig("consensus_mempool_test")
+// for testing
+func assertMempool(txn txNotifier) mempl.Mempool {
+	return txn.(mempl.Mempool)
 }
 
 func TestMempoolNoProgressUntilTxsAvailable(t *testing.T) {
 	config := ResetConfig("consensus_mempool_txs_available_test")
+	defer os.RemoveAll(config.RootDir)
 	config.Consensus.CreateEmptyBlocks = false
 	state, privVals := randGenesisState(1, false, 10)
-	cs := newConsensusStateWithConfig(config, state, privVals[0], NewCounterApplication())
-	cs.mempool.EnableTxsAvailable()
+	cs := newStateWithConfig(config, state, privVals[0], NewCounterApplication())
+	assertMempool(cs.txNotifier).EnableTxsAvailable()
 	height, round := cs.Height, cs.Round
 	newBlockCh := subscribe(cs.eventBus, types.EventQueryNewBlock)
 	startTestRound(cs, height, round)
 
-	ensureNewStep(newBlockCh) // first block gets committed
-	ensureNoNewStep(newBlockCh)
+	ensureNewEventOnChannel(newBlockCh) // first block gets committed
+	ensureNoNewEventOnChannel(newBlockCh)
 	deliverTxsRange(cs, 0, 1)
-	ensureNewStep(newBlockCh) // commit txs
-	ensureNewStep(newBlockCh) // commit updated app hash
-	ensureNoNewStep(newBlockCh)
+	ensureNewEventOnChannel(newBlockCh) // commit txs
+	ensureNewEventOnChannel(newBlockCh) // commit updated app hash
+	ensureNoNewEventOnChannel(newBlockCh)
 }
 
 func TestMempoolProgressAfterCreateEmptyBlocksInterval(t *testing.T) {
 	config := ResetConfig("consensus_mempool_txs_available_test")
-	config.Consensus.CreateEmptyBlocksInterval = int(ensureTimeout.Seconds())
+	defer os.RemoveAll(config.RootDir)
+	config.Consensus.CreateEmptyBlocksInterval = ensureTimeout
 	state, privVals := randGenesisState(1, false, 10)
-	cs := newConsensusStateWithConfig(config, state, privVals[0], NewCounterApplication())
-	cs.mempool.EnableTxsAvailable()
+	cs := newStateWithConfig(config, state, privVals[0], NewCounterApplication())
+	assertMempool(cs.txNotifier).EnableTxsAvailable()
 	height, round := cs.Height, cs.Round
 	newBlockCh := subscribe(cs.eventBus, types.EventQueryNewBlock)
 	startTestRound(cs, height, round)
 
-	ensureNewStep(newBlockCh)   // first block gets committed
-	ensureNoNewStep(newBlockCh) // then we dont make a block ...
-	ensureNewStep(newBlockCh)   // until the CreateEmptyBlocksInterval has passed
+	ensureNewEventOnChannel(newBlockCh)   // first block gets committed
+	ensureNoNewEventOnChannel(newBlockCh) // then we dont make a block ...
+	ensureNewEventOnChannel(newBlockCh)   // until the CreateEmptyBlocksInterval has passed
 }
 
 func TestMempoolProgressInHigherRound(t *testing.T) {
 	config := ResetConfig("consensus_mempool_txs_available_test")
+	defer os.RemoveAll(config.RootDir)
 	config.Consensus.CreateEmptyBlocks = false
 	state, privVals := randGenesisState(1, false, 10)
-	cs := newConsensusStateWithConfig(config, state, privVals[0], NewCounterApplication())
-	cs.mempool.EnableTxsAvailable()
+	cs := newStateWithConfig(config, state, privVals[0], NewCounterApplication())
+	assertMempool(cs.txNotifier).EnableTxsAvailable()
 	height, round := cs.Height, cs.Round
 	newBlockCh := subscribe(cs.eventBus, types.EventQueryNewBlock)
 	newRoundCh := subscribe(cs.eventBus, types.EventQueryNewRound)
@@ -72,21 +79,27 @@ func TestMempoolProgressInHigherRound(t *testing.T) {
 	}
 	startTestRound(cs, height, round)
 
-	ensureNewStep(newRoundCh) // first round at first height
-	ensureNewStep(newBlockCh) // first block gets committed
-	ensureNewStep(newRoundCh) // first round at next height
-	deliverTxsRange(cs, 0, 1) // we deliver txs, but dont set a proposal so we get the next round
-	<-timeoutCh
-	ensureNewStep(newRoundCh) // wait for the next round
-	ensureNewStep(newBlockCh) // now we can commit the block
+	ensureNewRound(newRoundCh, height, round) // first round at first height
+	ensureNewEventOnChannel(newBlockCh)       // first block gets committed
+
+	height++ // moving to the next height
+	round = 0
+
+	ensureNewRound(newRoundCh, height, round) // first round at next height
+	deliverTxsRange(cs, 0, 1)                 // we deliver txs, but dont set a proposal so we get the next round
+	ensureNewTimeout(timeoutCh, height, round, cs.config.TimeoutPropose.Nanoseconds())
+
+	round++                                   // moving to the next round
+	ensureNewRound(newRoundCh, height, round) // wait for the next round
+	ensureNewEventOnChannel(newBlockCh)       // now we can commit the block
 }
 
-func deliverTxsRange(cs *ConsensusState, start, end int) {
+func deliverTxsRange(cs *State, start, end int) {
 	// Deliver some txs.
 	for i := start; i < end; i++ {
 		txBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(txBytes, uint64(i))
-		err := cs.mempool.CheckTx(txBytes, nil)
+		err := assertMempool(cs.txNotifier).CheckTx(txBytes, nil, mempl.TxInfo{})
 		if err != nil {
 			panic(fmt.Sprintf("Error after CheckTx: %v", err))
 		}
@@ -95,22 +108,22 @@ func deliverTxsRange(cs *ConsensusState, start, end int) {
 
 func TestMempoolTxConcurrentWithCommit(t *testing.T) {
 	state, privVals := randGenesisState(1, false, 10)
-	cs := newConsensusState(state, privVals[0], NewCounterApplication())
-	height, round := cs.Height, cs.Round
-	newBlockCh := subscribe(cs.eventBus, types.EventQueryNewBlock)
+	blockDB := dbm.NewMemDB()
+	cs := newStateWithConfigAndBlockStore(config, state, privVals[0], NewCounterApplication(), blockDB)
+	sm.SaveState(blockDB, state)
+	newBlockHeaderCh := subscribe(cs.eventBus, types.EventQueryNewBlockHeader)
 
-	NTxs := 3000
-	go deliverTxsRange(cs, 0, NTxs)
+	const numTxs int64 = 3000
+	go deliverTxsRange(cs, 0, int(numTxs))
 
-	startTestRound(cs, height, round)
-	for nTxs := 0; nTxs < NTxs; {
-		ticker := time.NewTicker(time.Second * 30)
+	startTestRound(cs, cs.Height, cs.Round)
+	for n := int64(0); n < numTxs; {
 		select {
-		case b := <-newBlockCh:
-			evt := b.(types.EventDataNewBlock)
-			nTxs += int(evt.Block.Header.NumTxs)
-		case <-ticker.C:
-			panic("Timed out waiting to commit blocks with transactions")
+		case msg := <-newBlockHeaderCh:
+			headerEvent := msg.Data().(types.EventDataNewBlockHeader)
+			n += headerEvent.NumTxs
+		case <-time.After(30 * time.Second):
+			t.Fatal("Timed out waiting 30s to commit blocks with transactions")
 		}
 	}
 }
@@ -118,13 +131,15 @@ func TestMempoolTxConcurrentWithCommit(t *testing.T) {
 func TestMempoolRmBadTx(t *testing.T) {
 	state, privVals := randGenesisState(1, false, 10)
 	app := NewCounterApplication()
-	cs := newConsensusState(state, privVals[0], app)
+	blockDB := dbm.NewMemDB()
+	cs := newStateWithConfigAndBlockStore(config, state, privVals[0], app, blockDB)
+	sm.SaveState(blockDB, state)
 
 	// increment the counter by 1
 	txBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(txBytes, uint64(0))
 
-	resDeliver := app.DeliverTx(txBytes)
+	resDeliver := app.DeliverTx(abci.RequestDeliverTx{Tx: txBytes})
 	assert.False(t, resDeliver.IsErr(), fmt.Sprintf("expected no error. got %v", resDeliver))
 
 	resCommit := app.Commit()
@@ -136,19 +151,21 @@ func TestMempoolRmBadTx(t *testing.T) {
 		// Try to send the tx through the mempool.
 		// CheckTx should not err, but the app should return a bad abci code
 		// and the tx should get removed from the pool
-		err := cs.mempool.CheckTx(txBytes, func(r *abci.Response) {
+		err := assertMempool(cs.txNotifier).CheckTx(txBytes, func(r *abci.Response) {
 			if r.GetCheckTx().Code != code.CodeTypeBadNonce {
-				t.Fatalf("expected checktx to return bad nonce, got %v", r)
+				t.Errorf("expected checktx to return bad nonce, got %v", r)
+				return
 			}
 			checkTxRespCh <- struct{}{}
-		})
+		}, mempl.TxInfo{})
 		if err != nil {
-			t.Fatalf("Error after CheckTx: %v", err)
+			t.Errorf("error after CheckTx: %v", err)
+			return
 		}
 
 		// check for the tx
 		for {
-			txs := cs.mempool.ReapMaxBytesMaxGas(int64(len(txBytes)), -1)
+			txs := assertMempool(cs.txNotifier).ReapMaxBytesMaxGas(int64(len(txBytes)), -1)
 			if len(txs) == 0 {
 				emptyMempoolCh <- struct{}{}
 				return
@@ -163,7 +180,8 @@ func TestMempoolRmBadTx(t *testing.T) {
 	case <-checkTxRespCh:
 		// success
 	case <-ticker:
-		t.Fatalf("Timed out waiting for tx to return")
+		t.Errorf("timed out waiting for tx to return")
+		return
 	}
 
 	// Wait until the tx is removed
@@ -172,7 +190,8 @@ func TestMempoolRmBadTx(t *testing.T) {
 	case <-emptyMempoolCh:
 		// success
 	case <-ticker:
-		t.Fatalf("Timed out waiting for tx to be removed")
+		t.Errorf("timed out waiting for tx to be removed")
+		return
 	}
 }
 
@@ -192,8 +211,8 @@ func (app *CounterApplication) Info(req abci.RequestInfo) abci.ResponseInfo {
 	return abci.ResponseInfo{Data: fmt.Sprintf("txs:%v", app.txCount)}
 }
 
-func (app *CounterApplication) DeliverTx(tx []byte) abci.ResponseDeliverTx {
-	txValue := txAsUint64(tx)
+func (app *CounterApplication) DeliverTx(req abci.RequestDeliverTx) abci.ResponseDeliverTx {
+	txValue := txAsUint64(req.Tx)
 	if txValue != uint64(app.txCount) {
 		return abci.ResponseDeliverTx{
 			Code: code.CodeTypeBadNonce,
@@ -203,8 +222,8 @@ func (app *CounterApplication) DeliverTx(tx []byte) abci.ResponseDeliverTx {
 	return abci.ResponseDeliverTx{Code: code.CodeTypeOK}
 }
 
-func (app *CounterApplication) CheckTx(tx []byte) abci.ResponseCheckTx {
-	txValue := txAsUint64(tx)
+func (app *CounterApplication) CheckTx(req abci.RequestCheckTx) abci.ResponseCheckTx {
+	txValue := txAsUint64(req.Tx)
 	if txValue != uint64(app.mempoolTxCount) {
 		return abci.ResponseCheckTx{
 			Code: code.CodeTypeBadNonce,

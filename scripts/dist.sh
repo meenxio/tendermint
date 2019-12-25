@@ -6,7 +6,7 @@ set -e
 
 # Get the version from the environment, or try to figure it out.
 if [ -z $VERSION ]; then
-	VERSION=$(awk -F\" '/Version =/ { print $2; exit }' < version/version.go)
+	VERSION=$(awk -F\" 'TMCoreSemVer =/ { print $2; exit }' < version/version.go)
 fi
 if [ -z "$VERSION" ]; then
     echo "Please specify a version."
@@ -29,10 +29,7 @@ XC_OS=${XC_OS:-"solaris darwin freebsd linux windows"}
 XC_EXCLUDE=${XC_EXCLUDE:-" darwin/arm solaris/amd64 solaris/386 solaris/arm freebsd/amd64 windows/arm "}
 
 # Make sure build tools are available.
-make get_tools
-
-# Get VENDORED dependencies
-make get_vendor_deps
+make tools
 
 # Build!
 # ldflags: -s Omit the symbol table and debug information.

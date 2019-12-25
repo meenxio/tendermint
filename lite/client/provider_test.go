@@ -14,13 +14,12 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	app := kvstore.NewKVStoreApplication()
+	app := kvstore.NewApplication()
 	node := rpctest.StartTendermint(app)
 
 	code := m.Run()
 
-	node.Stop()
-	node.Wait()
+	rpctest.StopTendermint(node)
 	os.Exit(code)
 }
 
@@ -28,6 +27,7 @@ func TestProvider(t *testing.T) {
 	assert, require := assert.New(t), require.New(t)
 
 	cfg := rpctest.GetConfig()
+	defer os.RemoveAll(cfg.RootDir)
 	rpcAddr := cfg.RPC.ListenAddress
 	genDoc, err := types.GenesisDocFromFile(cfg.GenesisFile())
 	if err != nil {

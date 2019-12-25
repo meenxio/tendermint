@@ -4,20 +4,38 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
 	"strings"
 
+	"github.com/pkg/errors"
 	"github.com/tendermint/tendermint/crypto/merkle"
-	cmn "github.com/tendermint/tendermint/libs/common"
+	tmmath "github.com/tendermint/tendermint/libs/math"
+)
+
+const (
+	// MaxTotalVotingPower - the maximum allowed total voting power.
+	// It needs to be sufficiently small to, in all cases:
+	// 1. prevent clipping in incrementProposerPriority()
+	// 2. let (diff+diffMax-1) not overflow in IncrementProposerPriority()
+	// (Proof of 1 is tricky, left to the reader).
+	// It could be higher, but this is sufficiently large for our purposes,
+	// and leaves room for defensive purposes.
+	MaxTotalVotingPower = int64(math.MaxInt64) / 8
+
+	// PriorityWindowSizeFactor - is a constant that when multiplied with the total voting power gives
+	// the maximum allowed distance between validator priorities.
+	PriorityWindowSizeFactor = 2
 )
 
 // ValidatorSet represent a set of *Validator at a given height.
 // The validators can be fetched by address or index.
 // The index is in order of .Address, so the indices are fixed
-// for all rounds of a given blockchain height.
-// On the other hand, the .AccumPower of each validator and
+// for all rounds of a given blockchain height - ie. the validators
+// are sorted by their address.
+// On the other hand, the .ProposerPriority of each validator and
 // the designated .GetProposer() of a set changes every round,
-// upon calling .IncrementAccum().
+// upon calling .IncrementProposerPriority().
 // NOTE: Not goroutine-safe.
 // NOTE: All get/set to validators should copy the value for safety.
 type ValidatorSet struct {
@@ -29,72 +47,176 @@ type ValidatorSet struct {
 	totalVotingPower int64
 }
 
+// NewValidatorSet initializes a ValidatorSet by copying over the
+// values from `valz`, a list of Validators. If valz is nil or empty,
+// the new ValidatorSet will have an empty list of Validators.
+// The addresses of validators in `valz` must be unique otherwise the
+// function panics.
+// Note the validator set size has an implied limit equal to that of the MaxVotesCount -
+// commits by a validator set larger than this will fail validation.
 func NewValidatorSet(valz []*Validator) *ValidatorSet {
-	if valz != nil && len(valz) == 0 {
-		panic("validator set initialization slice cannot be an empty slice (but it can be nil)")
-	}
-	validators := make([]*Validator, len(valz))
-	for i, val := range valz {
-		validators[i] = val.Copy()
-	}
-	sort.Sort(ValidatorsByAddress(validators))
-	vals := &ValidatorSet{
-		Validators: validators,
+	vals := &ValidatorSet{}
+	err := vals.updateWithChangeSet(valz, false)
+	if err != nil {
+		panic(fmt.Sprintf("cannot create validator set: %s", err))
 	}
 	if len(valz) > 0 {
-		vals.IncrementAccum(1)
+		vals.IncrementProposerPriority(1)
 	}
-
 	return vals
 }
 
-// Nil or empty validator sets are invalid.
+// IsNilOrEmpty returns true if validator set is nil or empty.
 func (vals *ValidatorSet) IsNilOrEmpty() bool {
 	return vals == nil || len(vals.Validators) == 0
 }
 
-// Increment Accum and update the proposer on a copy, and return it.
-func (vals *ValidatorSet) CopyIncrementAccum(times int) *ValidatorSet {
+// CopyIncrementProposerPriority increments ProposerPriority and updates the
+// proposer on a copy, and returns it.
+func (vals *ValidatorSet) CopyIncrementProposerPriority(times int) *ValidatorSet {
 	copy := vals.Copy()
-	copy.IncrementAccum(times)
+	copy.IncrementProposerPriority(times)
 	return copy
 }
 
-// IncrementAccum increments accum of each validator and updates the
+// IncrementProposerPriority increments ProposerPriority of each validator and updates the
 // proposer. Panics if validator set is empty.
-func (vals *ValidatorSet) IncrementAccum(times int) {
-
-	// Add VotingPower * times to each validator and order into heap.
-	validatorsHeap := cmn.NewHeap()
-	for _, val := range vals.Validators {
-		// Check for overflow both multiplication and sum.
-		val.Accum = safeAddClip(val.Accum, safeMulClip(val.VotingPower, int64(times)))
-		validatorsHeap.PushComparable(val, accumComparable{val})
+// `times` must be positive.
+func (vals *ValidatorSet) IncrementProposerPriority(times int) {
+	if vals.IsNilOrEmpty() {
+		panic("empty validator set")
+	}
+	if times <= 0 {
+		panic("Cannot call IncrementProposerPriority with non-positive times")
 	}
 
-	// Decrement the validator with most accum times times.
-	for i := 0; i < times; i++ {
-		mostest := validatorsHeap.Peek().(*Validator)
-		// mind underflow
-		mostest.Accum = safeSubClip(mostest.Accum, vals.TotalVotingPower())
+	// Cap the difference between priorities to be proportional to 2*totalPower by
+	// re-normalizing priorities, i.e., rescale all priorities by multiplying with:
+	//  2*totalVotingPower/(maxPriority - minPriority)
+	diffMax := PriorityWindowSizeFactor * vals.TotalVotingPower()
+	vals.RescalePriorities(diffMax)
+	vals.shiftByAvgProposerPriority()
 
-		if i == times-1 {
-			vals.Proposer = mostest
-		} else {
-			validatorsHeap.Update(mostest, accumComparable{mostest})
+	var proposer *Validator
+	// Call IncrementProposerPriority(1) times times.
+	for i := 0; i < times; i++ {
+		proposer = vals.incrementProposerPriority()
+	}
+
+	vals.Proposer = proposer
+}
+
+// RescalePriorities rescales the priorities such that the distance between the maximum and minimum
+// is smaller than `diffMax`.
+func (vals *ValidatorSet) RescalePriorities(diffMax int64) {
+	if vals.IsNilOrEmpty() {
+		panic("empty validator set")
+	}
+	// NOTE: This check is merely a sanity check which could be
+	// removed if all tests would init. voting power appropriately;
+	// i.e. diffMax should always be > 0
+	if diffMax <= 0 {
+		return
+	}
+
+	// Calculating ceil(diff/diffMax):
+	// Re-normalization is performed by dividing by an integer for simplicity.
+	// NOTE: This may make debugging priority issues easier as well.
+	diff := computeMaxMinPriorityDiff(vals)
+	ratio := (diff + diffMax - 1) / diffMax
+	if diff > diffMax {
+		for _, val := range vals.Validators {
+			val.ProposerPriority /= ratio
 		}
 	}
 }
 
-// Copy each validator into a new ValidatorSet
-func (vals *ValidatorSet) Copy() *ValidatorSet {
-	validators := make([]*Validator, len(vals.Validators))
-	for i, val := range vals.Validators {
-		// NOTE: must copy, since IncrementAccum updates in place.
-		validators[i] = val.Copy()
+func (vals *ValidatorSet) incrementProposerPriority() *Validator {
+	for _, val := range vals.Validators {
+		// Check for overflow for sum.
+		newPrio := safeAddClip(val.ProposerPriority, val.VotingPower)
+		val.ProposerPriority = newPrio
 	}
+	// Decrement the validator with most ProposerPriority.
+	mostest := vals.getValWithMostPriority()
+	// Mind the underflow.
+	mostest.ProposerPriority = safeSubClip(mostest.ProposerPriority, vals.TotalVotingPower())
+
+	return mostest
+}
+
+// Should not be called on an empty validator set.
+func (vals *ValidatorSet) computeAvgProposerPriority() int64 {
+	n := int64(len(vals.Validators))
+	sum := big.NewInt(0)
+	for _, val := range vals.Validators {
+		sum.Add(sum, big.NewInt(val.ProposerPriority))
+	}
+	avg := sum.Div(sum, big.NewInt(n))
+	if avg.IsInt64() {
+		return avg.Int64()
+	}
+
+	// This should never happen: each val.ProposerPriority is in bounds of int64.
+	panic(fmt.Sprintf("Cannot represent avg ProposerPriority as an int64 %v", avg))
+}
+
+// Compute the difference between the max and min ProposerPriority of that set.
+func computeMaxMinPriorityDiff(vals *ValidatorSet) int64 {
+	if vals.IsNilOrEmpty() {
+		panic("empty validator set")
+	}
+	max := int64(math.MinInt64)
+	min := int64(math.MaxInt64)
+	for _, v := range vals.Validators {
+		if v.ProposerPriority < min {
+			min = v.ProposerPriority
+		}
+		if v.ProposerPriority > max {
+			max = v.ProposerPriority
+		}
+	}
+	diff := max - min
+	if diff < 0 {
+		return -1 * diff
+	}
+	return diff
+}
+
+func (vals *ValidatorSet) getValWithMostPriority() *Validator {
+	var res *Validator
+	for _, val := range vals.Validators {
+		res = res.CompareProposerPriority(val)
+	}
+	return res
+}
+
+func (vals *ValidatorSet) shiftByAvgProposerPriority() {
+	if vals.IsNilOrEmpty() {
+		panic("empty validator set")
+	}
+	avgProposerPriority := vals.computeAvgProposerPriority()
+	for _, val := range vals.Validators {
+		val.ProposerPriority = safeSubClip(val.ProposerPriority, avgProposerPriority)
+	}
+}
+
+// Makes a copy of the validator list.
+func validatorListCopy(valsList []*Validator) []*Validator {
+	if valsList == nil {
+		return nil
+	}
+	valsCopy := make([]*Validator, len(valsList))
+	for i, val := range valsList {
+		valsCopy[i] = val.Copy()
+	}
+	return valsCopy
+}
+
+// Copy each validator into a new ValidatorSet.
+func (vals *ValidatorSet) Copy() *ValidatorSet {
 	return &ValidatorSet{
-		Validators:       validators,
+		Validators:       validatorListCopy(vals.Validators),
 		Proposer:         vals.Proposer,
 		totalVotingPower: vals.totalVotingPower,
 	}
@@ -137,13 +259,30 @@ func (vals *ValidatorSet) Size() int {
 	return len(vals.Validators)
 }
 
+// Forces recalculation of the set's total voting power.
+// Panics if total voting power is bigger than MaxTotalVotingPower.
+func (vals *ValidatorSet) updateTotalVotingPower() {
+
+	sum := int64(0)
+	for _, val := range vals.Validators {
+		// mind overflow
+		sum = safeAddClip(sum, val.VotingPower)
+		if sum > MaxTotalVotingPower {
+			panic(fmt.Sprintf(
+				"Total voting power should be guarded to not exceed %v; got: %v",
+				MaxTotalVotingPower,
+				sum))
+		}
+	}
+
+	vals.totalVotingPower = sum
+}
+
 // TotalVotingPower returns the sum of the voting powers of all validators.
+// It recomputes the total voting power if required.
 func (vals *ValidatorSet) TotalVotingPower() int64 {
 	if vals.totalVotingPower == 0 {
-		for _, val := range vals.Validators {
-			// mind overflow
-			vals.totalVotingPower = safeAddClip(vals.totalVotingPower, val.VotingPower)
-		}
+		vals.updateTotalVotingPower()
 	}
 	return vals.totalVotingPower
 }
@@ -164,7 +303,7 @@ func (vals *ValidatorSet) findProposer() *Validator {
 	var proposer *Validator
 	for _, val := range vals.Validators {
 		if proposer == nil || !bytes.Equal(val.Address, proposer.Address) {
-			proposer = proposer.CompareAccum(val)
+			proposer = proposer.CompareProposerPriority(val)
 		}
 	}
 	return proposer
@@ -176,74 +315,11 @@ func (vals *ValidatorSet) Hash() []byte {
 	if len(vals.Validators) == 0 {
 		return nil
 	}
-	hashers := make([]merkle.Hasher, len(vals.Validators))
+	bzs := make([][]byte, len(vals.Validators))
 	for i, val := range vals.Validators {
-		hashers[i] = val
+		bzs[i] = val.Bytes()
 	}
-	return merkle.SimpleHashFromHashers(hashers)
-}
-
-// Add adds val to the validator set and returns true. It returns false if val
-// is already in the set.
-func (vals *ValidatorSet) Add(val *Validator) (added bool) {
-	val = val.Copy()
-	idx := sort.Search(len(vals.Validators), func(i int) bool {
-		return bytes.Compare(val.Address, vals.Validators[i].Address) <= 0
-	})
-	if idx >= len(vals.Validators) {
-		vals.Validators = append(vals.Validators, val)
-		// Invalidate cache
-		vals.Proposer = nil
-		vals.totalVotingPower = 0
-		return true
-	} else if bytes.Equal(vals.Validators[idx].Address, val.Address) {
-		return false
-	} else {
-		newValidators := make([]*Validator, len(vals.Validators)+1)
-		copy(newValidators[:idx], vals.Validators[:idx])
-		newValidators[idx] = val
-		copy(newValidators[idx+1:], vals.Validators[idx:])
-		vals.Validators = newValidators
-		// Invalidate cache
-		vals.Proposer = nil
-		vals.totalVotingPower = 0
-		return true
-	}
-}
-
-// Update updates val and returns true. It returns false if val is not present
-// in the set.
-func (vals *ValidatorSet) Update(val *Validator) (updated bool) {
-	index, sameVal := vals.GetByAddress(val.Address)
-	if sameVal == nil {
-		return false
-	}
-	vals.Validators[index] = val.Copy()
-	// Invalidate cache
-	vals.Proposer = nil
-	vals.totalVotingPower = 0
-	return true
-}
-
-// Remove deletes the validator with address. It returns the validator removed
-// and true. If returns nil and false if validator is not present in the set.
-func (vals *ValidatorSet) Remove(address []byte) (val *Validator, removed bool) {
-	idx := sort.Search(len(vals.Validators), func(i int) bool {
-		return bytes.Compare(address, vals.Validators[i].Address) <= 0
-	})
-	if idx >= len(vals.Validators) || !bytes.Equal(vals.Validators[idx].Address, address) {
-		return nil, false
-	}
-	removedVal := vals.Validators[idx]
-	newValidators := vals.Validators[:idx]
-	if idx+1 < len(vals.Validators) {
-		newValidators = append(newValidators, vals.Validators[idx+1:]...)
-	}
-	vals.Validators = newValidators
-	// Invalidate cache
-	vals.Proposer = nil
-	vals.totalVotingPower = 0
-	return removedVal, true
+	return merkle.SimpleHashFromByteSlices(bzs)
 }
 
 // Iterate will run the given function over the set.
@@ -256,55 +332,339 @@ func (vals *ValidatorSet) Iterate(fn func(index int, val *Validator) bool) {
 	}
 }
 
-// Verify that +2/3 of the set had signed the given signBytes.
-func (vals *ValidatorSet) VerifyCommit(chainID string, blockID BlockID, height int64, commit *Commit) error {
-	if vals.Size() != len(commit.Precommits) {
-		return fmt.Errorf("Invalid commit -- wrong set size: %v vs %v", vals.Size(), len(commit.Precommits))
+// Checks changes against duplicates, splits the changes in updates and
+// removals, sorts them by address.
+//
+// Returns:
+// updates, removals - the sorted lists of updates and removals
+// err - non-nil if duplicate entries or entries with negative voting power are seen
+//
+// No changes are made to 'origChanges'.
+func processChanges(origChanges []*Validator) (updates, removals []*Validator, err error) {
+	// Make a deep copy of the changes and sort by address.
+	changes := validatorListCopy(origChanges)
+	sort.Sort(ValidatorsByAddress(changes))
+
+	removals = make([]*Validator, 0, len(changes))
+	updates = make([]*Validator, 0, len(changes))
+	var prevAddr Address
+
+	// Scan changes by address and append valid validators to updates or removals lists.
+	for _, valUpdate := range changes {
+		if bytes.Equal(valUpdate.Address, prevAddr) {
+			err = fmt.Errorf("duplicate entry %v in %v", valUpdate, changes)
+			return nil, nil, err
+		}
+
+		switch {
+		case valUpdate.VotingPower < 0:
+			err = fmt.Errorf("voting power can't be negative: %d", valUpdate.VotingPower)
+			return nil, nil, err
+		case valUpdate.VotingPower > MaxTotalVotingPower:
+			err = fmt.Errorf("to prevent clipping/overflow, voting power can't be higher than %d, got %d",
+				MaxTotalVotingPower, valUpdate.VotingPower)
+			return nil, nil, err
+		case valUpdate.VotingPower == 0:
+			removals = append(removals, valUpdate)
+		default:
+			updates = append(updates, valUpdate)
+		}
+
+		prevAddr = valUpdate.Address
 	}
-	if height != commit.Height() {
-		return fmt.Errorf("Invalid commit -- wrong height: %v vs %v", height, commit.Height())
+
+	return updates, removals, err
+}
+
+// verifyUpdates verifies a list of updates against a validator set, making sure the allowed
+// total voting power would not be exceeded if these updates would be applied to the set.
+//
+// Inputs:
+// updates - a list of proper validator changes, i.e. they have been verified by processChanges for duplicates
+//   and invalid values.
+// vals - the original validator set. Note that vals is NOT modified by this function.
+// removedPower - the total voting power that will be removed after the updates are verified and applied.
+//
+// Returns:
+// tvpAfterUpdatesBeforeRemovals -  the new total voting power if these updates would be applied without the removals.
+//   Note that this will be < 2 * MaxTotalVotingPower in case high power validators are removed and
+//   validators are added/ updated with high power values.
+//
+// err - non-nil if the maximum allowed total voting power would be exceeded
+func verifyUpdates(
+	updates []*Validator,
+	vals *ValidatorSet,
+	removedPower int64,
+) (tvpAfterUpdatesBeforeRemovals int64, err error) {
+	delta := func(update *Validator, vals *ValidatorSet) int64 {
+		_, val := vals.GetByAddress(update.Address)
+		if val != nil {
+			return update.VotingPower - val.VotingPower
+		}
+		return update.VotingPower
 	}
-	if !blockID.Equals(commit.BlockID) {
-		return fmt.Errorf("Invalid commit -- wrong block id: want %v got %v",
-			blockID, commit.BlockID)
+
+	updatesCopy := validatorListCopy(updates)
+	sort.Slice(updatesCopy, func(i, j int) bool {
+		return delta(updatesCopy[i], vals) < delta(updatesCopy[j], vals)
+	})
+
+	tvpAfterRemovals := vals.TotalVotingPower() - removedPower
+	for _, upd := range updatesCopy {
+		tvpAfterRemovals += delta(upd, vals)
+		if tvpAfterRemovals > MaxTotalVotingPower {
+			err = fmt.Errorf(
+				"failed to add/update validator %v, total voting power would exceed the max allowed %v",
+				upd.Address, MaxTotalVotingPower)
+			return 0, err
+		}
+	}
+	return tvpAfterRemovals + removedPower, nil
+}
+
+func numNewValidators(updates []*Validator, vals *ValidatorSet) int {
+	numNewValidators := 0
+	for _, valUpdate := range updates {
+		if !vals.HasAddress(valUpdate.Address) {
+			numNewValidators++
+		}
+	}
+	return numNewValidators
+}
+
+// computeNewPriorities computes the proposer priority for the validators not present in the set based on
+// 'updatedTotalVotingPower'.
+// Leaves unchanged the priorities of validators that are changed.
+//
+// 'updates' parameter must be a list of unique validators to be added or updated.
+//
+// 'updatedTotalVotingPower' is the total voting power of a set where all updates would be applied but
+//   not the removals. It must be < 2*MaxTotalVotingPower and may be close to this limit if close to
+//   MaxTotalVotingPower will be removed. This is still safe from overflow since MaxTotalVotingPower is maxInt64/8.
+//
+// No changes are made to the validator set 'vals'.
+func computeNewPriorities(updates []*Validator, vals *ValidatorSet, updatedTotalVotingPower int64) {
+
+	for _, valUpdate := range updates {
+		address := valUpdate.Address
+		_, val := vals.GetByAddress(address)
+		if val == nil {
+			// add val
+			// Set ProposerPriority to -C*totalVotingPower (with C ~= 1.125) to make sure validators can't
+			// un-bond and then re-bond to reset their (potentially previously negative) ProposerPriority to zero.
+			//
+			// Contract: updatedVotingPower < 2 * MaxTotalVotingPower to ensure ProposerPriority does
+			// not exceed the bounds of int64.
+			//
+			// Compute ProposerPriority = -1.125*totalVotingPower == -(updatedVotingPower + (updatedVotingPower >> 3)).
+			valUpdate.ProposerPriority = -(updatedTotalVotingPower + (updatedTotalVotingPower >> 3))
+		} else {
+			valUpdate.ProposerPriority = val.ProposerPriority
+		}
+	}
+
+}
+
+// Merges the vals' validator list with the updates list.
+// When two elements with same address are seen, the one from updates is selected.
+// Expects updates to be a list of updates sorted by address with no duplicates or errors,
+// must have been validated with verifyUpdates() and priorities computed with computeNewPriorities().
+func (vals *ValidatorSet) applyUpdates(updates []*Validator) {
+
+	existing := vals.Validators
+	merged := make([]*Validator, len(existing)+len(updates))
+	i := 0
+
+	for len(existing) > 0 && len(updates) > 0 {
+		if bytes.Compare(existing[0].Address, updates[0].Address) < 0 { // unchanged validator
+			merged[i] = existing[0]
+			existing = existing[1:]
+		} else {
+			// Apply add or update.
+			merged[i] = updates[0]
+			if bytes.Equal(existing[0].Address, updates[0].Address) {
+				// Validator is present in both, advance existing.
+				existing = existing[1:]
+			}
+			updates = updates[1:]
+		}
+		i++
+	}
+
+	// Add the elements which are left.
+	for j := 0; j < len(existing); j++ {
+		merged[i] = existing[j]
+		i++
+	}
+	// OR add updates which are left.
+	for j := 0; j < len(updates); j++ {
+		merged[i] = updates[j]
+		i++
+	}
+
+	vals.Validators = merged[:i]
+}
+
+// Checks that the validators to be removed are part of the validator set.
+// No changes are made to the validator set 'vals'.
+func verifyRemovals(deletes []*Validator, vals *ValidatorSet) (votingPower int64, err error) {
+
+	removedVotingPower := int64(0)
+	for _, valUpdate := range deletes {
+		address := valUpdate.Address
+		_, val := vals.GetByAddress(address)
+		if val == nil {
+			return removedVotingPower, fmt.Errorf("failed to find validator %X to remove", address)
+		}
+		removedVotingPower += val.VotingPower
+	}
+	if len(deletes) > len(vals.Validators) {
+		panic("more deletes than validators")
+	}
+	return removedVotingPower, nil
+}
+
+// Removes the validators specified in 'deletes' from validator set 'vals'.
+// Should not fail as verification has been done before.
+func (vals *ValidatorSet) applyRemovals(deletes []*Validator) {
+
+	existing := vals.Validators
+
+	merged := make([]*Validator, len(existing)-len(deletes))
+	i := 0
+
+	// Loop over deletes until we removed all of them.
+	for len(deletes) > 0 {
+		if bytes.Equal(existing[0].Address, deletes[0].Address) {
+			deletes = deletes[1:]
+		} else { // Leave it in the resulting slice.
+			merged[i] = existing[0]
+			i++
+		}
+		existing = existing[1:]
+	}
+
+	// Add the elements which are left.
+	for j := 0; j < len(existing); j++ {
+		merged[i] = existing[j]
+		i++
+	}
+
+	vals.Validators = merged[:i]
+}
+
+// Main function used by UpdateWithChangeSet() and NewValidatorSet().
+// If 'allowDeletes' is false then delete operations (identified by validators with voting power 0)
+// are not allowed and will trigger an error if present in 'changes'.
+// The 'allowDeletes' flag is set to false by NewValidatorSet() and to true by UpdateWithChangeSet().
+func (vals *ValidatorSet) updateWithChangeSet(changes []*Validator, allowDeletes bool) error {
+
+	if len(changes) == 0 {
+		return nil
+	}
+
+	// Check for duplicates within changes, split in 'updates' and 'deletes' lists (sorted).
+	updates, deletes, err := processChanges(changes)
+	if err != nil {
+		return err
+	}
+
+	if !allowDeletes && len(deletes) != 0 {
+		return fmt.Errorf("cannot process validators with voting power 0: %v", deletes)
+	}
+
+	// Check that the resulting set will not be empty.
+	if numNewValidators(updates, vals) == 0 && len(vals.Validators) == len(deletes) {
+		return errors.New("applying the validator changes would result in empty set")
+	}
+
+	// Verify that applying the 'deletes' against 'vals' will not result in error.
+	// Get the voting power that is going to be removed.
+	removedVotingPower, err := verifyRemovals(deletes, vals)
+	if err != nil {
+		return err
+	}
+
+	// Verify that applying the 'updates' against 'vals' will not result in error.
+	// Get the updated total voting power before removal. Note that this is < 2 * MaxTotalVotingPower
+	tvpAfterUpdatesBeforeRemovals, err := verifyUpdates(updates, vals, removedVotingPower)
+	if err != nil {
+		return err
+	}
+
+	// Compute the priorities for updates.
+	computeNewPriorities(updates, vals, tvpAfterUpdatesBeforeRemovals)
+
+	// Apply updates and removals.
+	vals.applyUpdates(updates)
+	vals.applyRemovals(deletes)
+
+	vals.updateTotalVotingPower() // will panic if total voting power > MaxTotalVotingPower
+
+	// Scale and center.
+	vals.RescalePriorities(PriorityWindowSizeFactor * vals.TotalVotingPower())
+	vals.shiftByAvgProposerPriority()
+
+	return nil
+}
+
+// UpdateWithChangeSet attempts to update the validator set with 'changes'.
+// It performs the following steps:
+// - validates the changes making sure there are no duplicates and splits them in updates and deletes
+// - verifies that applying the changes will not result in errors
+// - computes the total voting power BEFORE removals to ensure that in the next steps the priorities
+//   across old and newly added validators are fair
+// - computes the priorities of new validators against the final set
+// - applies the updates against the validator set
+// - applies the removals against the validator set
+// - performs scaling and centering of priority values
+// If an error is detected during verification steps, it is returned and the validator set
+// is not changed.
+func (vals *ValidatorSet) UpdateWithChangeSet(changes []*Validator) error {
+	return vals.updateWithChangeSet(changes, true)
+}
+
+// VerifyCommit verifies +2/3 of the set had signed the given commit.
+func (vals *ValidatorSet) VerifyCommit(chainID string, blockID BlockID,
+	height int64, commit *Commit) error {
+
+	if vals.Size() != len(commit.Signatures) {
+		return NewErrInvalidCommitSignatures(vals.Size(), len(commit.Signatures))
+	}
+	if err := vals.verifyCommitBasic(commit, height, blockID); err != nil {
+		return err
 	}
 
 	talliedVotingPower := int64(0)
-	round := commit.Round()
+	for idx, commitSig := range commit.Signatures {
+		if commitSig.Absent() {
+			continue // OK, some signatures can be absent.
+		}
 
-	for idx, precommit := range commit.Precommits {
-		if precommit == nil {
-			continue // OK, some precommits can be missing.
-		}
-		if precommit.Height != height {
-			return fmt.Errorf("Invalid commit -- wrong height: want %v got %v", height, precommit.Height)
-		}
-		if precommit.Round != round {
-			return fmt.Errorf("Invalid commit -- wrong round: want %v got %v", round, precommit.Round)
-		}
-		if precommit.Type != VoteTypePrecommit {
-			return fmt.Errorf("Invalid commit -- not precommit @ index %v", idx)
-		}
-		_, val := vals.GetByIndex(idx)
+		// The vals and commit have a 1-to-1 correspondance.
+		// This means we don't need the validator address or to do any lookup.
+		val := vals.Validators[idx]
+
 		// Validate signature.
-		precommitSignBytes := precommit.SignBytes(chainID)
-		if !val.PubKey.VerifyBytes(precommitSignBytes, precommit.Signature) {
-			return fmt.Errorf("Invalid commit -- invalid signature: %v", precommit)
+		voteSignBytes := commit.VoteSignBytes(chainID, idx)
+		if !val.PubKey.VerifyBytes(voteSignBytes, commitSig.Signature) {
+			return fmt.Errorf("wrong signature (#%d): %X", idx, commitSig.Signature)
 		}
-		// Good precommit!
-		if blockID.Equals(precommit.BlockID) {
+		// Good!
+		if blockID.Equals(commitSig.BlockID(commit.BlockID)) {
 			talliedVotingPower += val.VotingPower
-		} else {
-			// It's OK that the BlockID doesn't match.  We include stray
-			// precommits to measure validator availability.
 		}
+		// else {
+		// It's OK that the BlockID doesn't match.  We include stray
+		// signatures (~votes for nil) to measure validator availability.
+		// }
 	}
 
-	if talliedVotingPower > vals.TotalVotingPower()*2/3 {
-		return nil
+	if got, needed := talliedVotingPower, vals.TotalVotingPower()*2/3; got <= needed {
+		return ErrTooMuchChange{Got: got, Needed: needed}
 	}
-	return fmt.Errorf("Invalid commit -- insufficient voting power: got %v, needed %v",
-		talliedVotingPower, (vals.TotalVotingPower()*2/3 + 1))
+
+	return nil
 }
 
 // VerifyFutureCommit will check to see if the set would be valid with a different
@@ -349,59 +709,138 @@ func (vals *ValidatorSet) VerifyFutureCommit(newSet *ValidatorSet, chainID strin
 	// Check old voting power.
 	oldVotingPower := int64(0)
 	seen := map[int]bool{}
-	round := commit.Round()
 
-	for idx, precommit := range commit.Precommits {
-		if precommit == nil {
-			continue
+	for idx, commitSig := range commit.Signatures {
+		if commitSig.Absent() {
+			continue // OK, some signatures can be absent.
 		}
-		if precommit.Height != height {
-			return cmn.NewError("Blocks don't match - %d vs %d", round, precommit.Round)
-		}
-		if precommit.Round != round {
-			return cmn.NewError("Invalid commit -- wrong round: %v vs %v", round, precommit.Round)
-		}
-		if precommit.Type != VoteTypePrecommit {
-			return cmn.NewError("Invalid commit -- not precommit @ index %v", idx)
-		}
+
 		// See if this validator is in oldVals.
-		idx, val := oldVals.GetByAddress(precommit.ValidatorAddress)
-		if val == nil || seen[idx] {
+		oldIdx, val := oldVals.GetByAddress(commitSig.ValidatorAddress)
+		if val == nil || seen[oldIdx] {
 			continue // missing or double vote...
 		}
-		seen[idx] = true
+		seen[oldIdx] = true
 
 		// Validate signature.
-		precommitSignBytes := precommit.SignBytes(chainID)
-		if !val.PubKey.VerifyBytes(precommitSignBytes, precommit.Signature) {
-			return cmn.NewError("Invalid commit -- invalid signature: %v", precommit)
+		voteSignBytes := commit.VoteSignBytes(chainID, idx)
+		if !val.PubKey.VerifyBytes(voteSignBytes, commitSig.Signature) {
+			return errors.Errorf("wrong signature (#%d): %X", idx, commitSig.Signature)
 		}
-		// Good precommit!
-		if blockID.Equals(precommit.BlockID) {
+		// Good!
+		if blockID.Equals(commitSig.BlockID(commit.BlockID)) {
 			oldVotingPower += val.VotingPower
-		} else {
-			// It's OK that the BlockID doesn't match.  We include stray
-			// precommits to measure validator availability.
 		}
+		// else {
+		// It's OK that the BlockID doesn't match.  We include stray
+		// signatures (~votes for nil) to measure validator availability.
+		// }
 	}
 
-	if oldVotingPower <= oldVals.TotalVotingPower()*2/3 {
-		return cmn.NewError("Invalid commit -- insufficient old voting power: got %v, needed %v",
-			oldVotingPower, (oldVals.TotalVotingPower()*2/3 + 1))
+	if got, needed := oldVotingPower, oldVals.TotalVotingPower()*2/3; got <= needed {
+		return ErrTooMuchChange{Got: got, Needed: needed}
 	}
 	return nil
 }
+
+// VerifyCommitTrusting verifies that trustLevel ([1/3, 1]) of the validator
+// set signed this commit.
+// NOTE the given validators do not necessarily correspond to the validator set
+// for this commit, but there may be some intersection.
+func (vals *ValidatorSet) VerifyCommitTrusting(chainID string, blockID BlockID,
+	height int64, commit *Commit, trustLevel tmmath.Fraction) error {
+
+	if trustLevel.Numerator*3 < trustLevel.Denominator || // < 1/3
+		trustLevel.Numerator > trustLevel.Denominator { // > 1
+		panic(fmt.Sprintf("trustLevel must be within [1/3, 1], given %v", trustLevel))
+	}
+
+	if err := vals.verifyCommitBasic(commit, height, blockID); err != nil {
+		return err
+	}
+
+	talliedVotingPower := int64(0)
+	for idx, commitSig := range commit.Signatures {
+		if commitSig.Absent() {
+			continue // OK, some signatures can be absent.
+		}
+
+		// We don't know the validators that committed this block, so we have to
+		// check for each vote if its validator is already known.
+		_, val := vals.GetByAddress(commitSig.ValidatorAddress)
+		if val != nil {
+			// Validate signature.
+			voteSignBytes := commit.VoteSignBytes(chainID, idx)
+			if !val.PubKey.VerifyBytes(voteSignBytes, commitSig.Signature) {
+				return errors.Errorf("wrong signature (#%d): %X", idx, commitSig.Signature)
+			}
+
+			// Good!
+			if blockID.Equals(commitSig.BlockID(commit.BlockID)) {
+				talliedVotingPower += val.VotingPower
+			}
+			// else {
+			// It's OK that the BlockID doesn't match.  We include stray
+			// signatures (~votes for nil) to measure validator availability.
+			// }
+		}
+	}
+
+	got := talliedVotingPower
+	needed := (vals.TotalVotingPower() * trustLevel.Numerator) / trustLevel.Denominator
+	if got <= needed {
+		return ErrTooMuchChange{Got: got, Needed: needed}
+	}
+
+	return nil
+}
+
+func (vals *ValidatorSet) verifyCommitBasic(commit *Commit, height int64, blockID BlockID) error {
+	if err := commit.ValidateBasic(); err != nil {
+		return err
+	}
+	if height != commit.Height {
+		return NewErrInvalidCommitHeight(height, commit.Height)
+	}
+	if !blockID.Equals(commit.BlockID) {
+		return fmt.Errorf("invalid commit -- wrong block ID: want %v, got %v",
+			blockID, commit.BlockID)
+	}
+	return nil
+}
+
+//-----------------
+// ErrTooMuchChange
+
+// IsErrTooMuchChange returns true if err is related to changes in validator
+// set exceeding max limit.
+func IsErrTooMuchChange(err error) bool {
+	_, ok := errors.Cause(err).(ErrTooMuchChange)
+	return ok
+}
+
+// ErrTooMuchChange indicates that changes in the validator set exceeded max limit.
+type ErrTooMuchChange struct {
+	Got    int64
+	Needed int64
+}
+
+func (e ErrTooMuchChange) Error() string {
+	return fmt.Sprintf("invalid commit -- insufficient old voting power: got %d, needed more than %d", e.Got, e.Needed)
+}
+
+//----------------
 
 func (vals *ValidatorSet) String() string {
 	return vals.StringIndented("")
 }
 
-// String
+// StringIndented returns an intended string representation of ValidatorSet.
 func (vals *ValidatorSet) StringIndented(indent string) string {
 	if vals == nil {
 		return "nil-ValidatorSet"
 	}
-	valStrings := []string{}
+	var valStrings []string
 	vals.Iterate(func(index int, val *Validator) bool {
 		valStrings = append(valStrings, val.String())
 		return false
@@ -421,7 +860,7 @@ func (vals *ValidatorSet) StringIndented(indent string) string {
 //-------------------------------------
 // Implements sort for sorting validators by address.
 
-// Sort validators by address
+// ValidatorsByAddress implements the sort of validators by address.
 type ValidatorsByAddress []*Validator
 
 func (valz ValidatorsByAddress) Len() int {
@@ -438,22 +877,8 @@ func (valz ValidatorsByAddress) Swap(i, j int) {
 	valz[j] = it
 }
 
-//-------------------------------------
-// Use with Heap for sorting validators by accum
-
-type accumComparable struct {
-	*Validator
-}
-
-// We want to find the validator with the greatest accum.
-func (ac accumComparable) Less(o interface{}) bool {
-	other := o.(accumComparable).Validator
-	larger := ac.CompareAccum(other)
-	return bytes.Equal(larger.Address, ac.Address)
-}
-
 //----------------------------------------
-// For testing
+// for testing
 
 // RandValidatorSet returns a randomized validator set, useful for testing.
 // NOTE: PrivValidator are in order.
@@ -472,24 +897,7 @@ func RandValidatorSet(numValidators int, votingPower int64) (*ValidatorSet, []Pr
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Safe multiplication and addition/subtraction
-
-func safeMul(a, b int64) (int64, bool) {
-	if a == 0 || b == 0 {
-		return 0, false
-	}
-	if a == 1 {
-		return b, false
-	}
-	if b == 1 {
-		return a, false
-	}
-	if a == math.MinInt64 || b == math.MinInt64 {
-		return -1, true
-	}
-	c := a * b
-	return c, c/b != a
-}
+// safe addition/subtraction
 
 func safeAdd(a, b int64) (int64, bool) {
 	if b > 0 && a > math.MaxInt64-b {
@@ -507,17 +915,6 @@ func safeSub(a, b int64) (int64, bool) {
 		return -1, true
 	}
 	return a - b, false
-}
-
-func safeMulClip(a, b int64) int64 {
-	c, overflow := safeMul(a, b)
-	if overflow {
-		if (a < 0 || b < 0) && !(a < 0 && b < 0) {
-			return math.MinInt64
-		}
-		return math.MaxInt64
-	}
-	return c
 }
 
 func safeAddClip(a, b int64) int64 {

@@ -3,15 +3,15 @@
 # XXX: this script is intended to be run from a fresh Digital Ocean droplet
 
 # NOTE: you must set this manually now
-echo "export DO_API_TOKEN=\"yourToken\"" >> ~/.profile
+echo "export DO_API_TOKEN=\"yourtoken\"" >> ~/.profile
 
 sudo apt-get update -y
 sudo apt-get upgrade -y
 sudo apt-get install -y jq unzip python-pip software-properties-common make
 
 # get and unpack golang
-curl -O https://storage.googleapis.com/golang/go1.10.linux-amd64.tar.gz
-tar -xvf go1.10.linux-amd64.tar.gz
+curl -O https://storage.googleapis.com/golang/go1.13.linux-amd64.tar.gz
+tar -xvf go1.13.linux-amd64.tar.gz
 
 ## move binary and add to path
 mv go /usr/local
@@ -21,19 +21,25 @@ echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.profile
 mkdir goApps
 echo "export GOPATH=/root/goApps" >> ~/.profile
 echo "export PATH=\$PATH:\$GOPATH/bin" >> ~/.profile
+# **turn on the go module, default is auto. The value is off, if tendermint source code
+#is downloaded under $GOPATH/src directory
+echo "export GO111MODULE=on" >> ~/.profile
 
 source ~/.profile
 
-## get the code and move into repo
-REPO=github.com/tendermint/tendermint
-go get $REPO
-cd $GOPATH/src/$REPO
-
+mkdir -p $GOPATH/src/github.com/tendermint
+cd $GOPATH/src/github.com/tendermint
+# ** use git clone instead of go get.
+# once go module is on, go get will download source code to
+# specific version directory under $GOPATH/pkg/mod the make
+# script will not work
+git clone https://github.com/tendermint/tendermint.git
+cd tendermint
 ## build
-git checkout zach/ansible
-make get_tools
-make get_vendor_deps
+make tools
 make build
+#** need to install the package, otherwise terdermint testnet will not execute
+make install
 
 # generate an ssh key
 ssh-keygen -f $HOME/.ssh/id_rsa -t rsa -N ''
@@ -84,8 +90,11 @@ ip3=$(strip $ip3)
 # all the ansible commands are also directory specific
 cd $GOPATH/src/github.com/tendermint/tendermint/networks/remote/ansible
 
+# create config dirs
+tendermint testnet
+
 ansible-playbook -i inventory/digital_ocean.py -l sentrynet install.yml
-ansible-playbook -i inventory/digital_ocean.py -l sentrynet config.yml -e BINARY=$GOPATH/src/github.com/tendermint/tendermint/build/tendermint -e CONFIGDIR=$GOPATH/src/github.com/tendermint/tendermint/docs/examples
+ansible-playbook -i inventory/digital_ocean.py -l sentrynet config.yml -e BINARY=$GOPATH/src/github.com/tendermint/tendermint/build/tendermint -e CONFIGDIR=$GOPATH/src/github.com/tendermint/tendermint/networks/remote/ansible/mytestnet
 
 sleep 10
 

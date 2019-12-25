@@ -1,3 +1,5 @@
+package mock
+
 /*
 package mock returns a Client implementation that
 accepts various (mock) implementations of the various methods.
@@ -11,15 +13,16 @@ For real clients, you probably want the "http" package.  If you
 want to directly call a tendermint node in process, you can use the
 "local" package.
 */
-package mock
 
 import (
 	"reflect"
 
-	cmn "github.com/tendermint/tendermint/libs/common"
+	"github.com/tendermint/tendermint/libs/bytes"
+	"github.com/tendermint/tendermint/libs/service"
 	"github.com/tendermint/tendermint/rpc/client"
 	"github.com/tendermint/tendermint/rpc/core"
 	ctypes "github.com/tendermint/tendermint/rpc/core/types"
+	rpctypes "github.com/tendermint/tendermint/rpc/lib/types"
 	"github.com/tendermint/tendermint/types"
 )
 
@@ -34,7 +37,9 @@ type Client struct {
 	client.HistoryClient
 	client.StatusClient
 	client.EventsClient
-	cmn.Service
+	client.EvidenceClient
+	client.MempoolClient
+	service.Service
 }
 
 var _ client.Client = Client{}
@@ -75,61 +80,84 @@ func (c Call) GetResponse(args interface{}) (interface{}, error) {
 }
 
 func (c Client) Status() (*ctypes.ResultStatus, error) {
-	return core.Status()
+	return core.Status(&rpctypes.Context{})
 }
 
 func (c Client) ABCIInfo() (*ctypes.ResultABCIInfo, error) {
-	return core.ABCIInfo()
+	return core.ABCIInfo(&rpctypes.Context{})
 }
 
-func (c Client) ABCIQuery(path string, data cmn.HexBytes) (*ctypes.ResultABCIQuery, error) {
+func (c Client) ABCIQuery(path string, data bytes.HexBytes) (*ctypes.ResultABCIQuery, error) {
 	return c.ABCIQueryWithOptions(path, data, client.DefaultABCIQueryOptions)
 }
 
-func (c Client) ABCIQueryWithOptions(path string, data cmn.HexBytes, opts client.ABCIQueryOptions) (*ctypes.ResultABCIQuery, error) {
-	return core.ABCIQuery(path, data, opts.Height, opts.Trusted)
+func (c Client) ABCIQueryWithOptions(
+	path string,
+	data bytes.HexBytes,
+	opts client.ABCIQueryOptions) (*ctypes.ResultABCIQuery, error) {
+	return core.ABCIQuery(&rpctypes.Context{}, path, data, opts.Height, opts.Prove)
 }
 
 func (c Client) BroadcastTxCommit(tx types.Tx) (*ctypes.ResultBroadcastTxCommit, error) {
-	return core.BroadcastTxCommit(tx)
+	return core.BroadcastTxCommit(&rpctypes.Context{}, tx)
 }
 
 func (c Client) BroadcastTxAsync(tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
-	return core.BroadcastTxAsync(tx)
+	return core.BroadcastTxAsync(&rpctypes.Context{}, tx)
 }
 
 func (c Client) BroadcastTxSync(tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
-	return core.BroadcastTxSync(tx)
+	return core.BroadcastTxSync(&rpctypes.Context{}, tx)
 }
 
 func (c Client) NetInfo() (*ctypes.ResultNetInfo, error) {
-	return core.NetInfo()
+	return core.NetInfo(&rpctypes.Context{})
+}
+
+func (c Client) ConsensusState() (*ctypes.ResultConsensusState, error) {
+	return core.ConsensusState(&rpctypes.Context{})
+}
+
+func (c Client) DumpConsensusState() (*ctypes.ResultDumpConsensusState, error) {
+	return core.DumpConsensusState(&rpctypes.Context{})
+}
+
+func (c Client) ConsensusParams(height *int64) (*ctypes.ResultConsensusParams, error) {
+	return core.ConsensusParams(&rpctypes.Context{}, height)
+}
+
+func (c Client) Health() (*ctypes.ResultHealth, error) {
+	return core.Health(&rpctypes.Context{})
 }
 
 func (c Client) DialSeeds(seeds []string) (*ctypes.ResultDialSeeds, error) {
-	return core.UnsafeDialSeeds(seeds)
+	return core.UnsafeDialSeeds(&rpctypes.Context{}, seeds)
 }
 
 func (c Client) DialPeers(peers []string, persistent bool) (*ctypes.ResultDialPeers, error) {
-	return core.UnsafeDialPeers(peers, persistent)
+	return core.UnsafeDialPeers(&rpctypes.Context{}, peers, persistent)
 }
 
 func (c Client) BlockchainInfo(minHeight, maxHeight int64) (*ctypes.ResultBlockchainInfo, error) {
-	return core.BlockchainInfo(minHeight, maxHeight)
+	return core.BlockchainInfo(&rpctypes.Context{}, minHeight, maxHeight)
 }
 
 func (c Client) Genesis() (*ctypes.ResultGenesis, error) {
-	return core.Genesis()
+	return core.Genesis(&rpctypes.Context{})
 }
 
 func (c Client) Block(height *int64) (*ctypes.ResultBlock, error) {
-	return core.Block(height)
+	return core.Block(&rpctypes.Context{}, height)
 }
 
 func (c Client) Commit(height *int64) (*ctypes.ResultCommit, error) {
-	return core.Commit(height)
+	return core.Commit(&rpctypes.Context{}, height)
 }
 
-func (c Client) Validators(height *int64) (*ctypes.ResultValidators, error) {
-	return core.Validators(height)
+func (c Client) Validators(height *int64, page, perPage int) (*ctypes.ResultValidators, error) {
+	return core.Validators(&rpctypes.Context{}, height, page, perPage)
+}
+
+func (c Client) BroadcastEvidence(ev types.Evidence) (*ctypes.ResultBroadcastEvidence, error) {
+	return core.BroadcastEvidence(&rpctypes.Context{}, ev)
 }

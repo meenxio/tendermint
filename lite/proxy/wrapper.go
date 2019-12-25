@@ -1,11 +1,14 @@
 package proxy
 
 import (
-	cmn "github.com/tendermint/tendermint/libs/common"
+	"context"
 
+	"github.com/tendermint/tendermint/crypto/merkle"
+	"github.com/tendermint/tendermint/libs/bytes"
 	"github.com/tendermint/tendermint/lite"
 	rpcclient "github.com/tendermint/tendermint/rpc/client"
 	ctypes "github.com/tendermint/tendermint/rpc/core/types"
+	rpctypes "github.com/tendermint/tendermint/rpc/lib/types"
 )
 
 var _ rpcclient.Client = Wrapper{}
@@ -15,6 +18,7 @@ var _ rpcclient.Client = Wrapper{}
 type Wrapper struct {
 	rpcclient.Client
 	cert *lite.DynamicVerifier
+	prt  *merkle.ProofRuntime
 }
 
 // SecureClient uses a given Verifier to wrap an connection to an untrusted
@@ -22,7 +26,8 @@ type Wrapper struct {
 //
 // If it is wrapping an HTTP rpcclient, it will also wrap the websocket interface
 func SecureClient(c rpcclient.Client, cert *lite.DynamicVerifier) Wrapper {
-	wrap := Wrapper{c, cert}
+	prt := defaultProofRuntime()
+	wrap := Wrapper{c, cert, prt}
 	// TODO: no longer possible as no more such interface exposed....
 	// if we wrap http client, then we can swap out the event switch to filter
 	// if hc, ok := c.(*rpcclient.HTTP); ok {
@@ -33,15 +38,15 @@ func SecureClient(c rpcclient.Client, cert *lite.DynamicVerifier) Wrapper {
 }
 
 // ABCIQueryWithOptions exposes all options for the ABCI query and verifies the returned proof
-func (w Wrapper) ABCIQueryWithOptions(path string, data cmn.HexBytes,
+func (w Wrapper) ABCIQueryWithOptions(path string, data bytes.HexBytes,
 	opts rpcclient.ABCIQueryOptions) (*ctypes.ResultABCIQuery, error) {
 
-	res, _, err := GetWithProofOptions(path, data, opts, w.Client, w.cert)
+	res, err := GetWithProofOptions(w.prt, path, data, opts, w.Client, w.cert)
 	return res, err
 }
 
 // ABCIQuery uses default options for the ABCI query and verifies the returned proof
-func (w Wrapper) ABCIQuery(path string, data cmn.HexBytes) (*ctypes.ResultABCIQuery, error) {
+func (w Wrapper) ABCIQuery(path string, data bytes.HexBytes) (*ctypes.ResultABCIQuery, error) {
 	return w.ABCIQueryWithOptions(path, data, rpcclient.DefaultABCIQueryOptions)
 }
 
@@ -51,7 +56,7 @@ func (w Wrapper) Tx(hash []byte, prove bool) (*ctypes.ResultTx, error) {
 	if !prove || err != nil {
 		return res, err
 	}
-	h := int64(res.Height)
+	h := res.Height
 	sh, err := GetCertifiedCommit(h, w.Client, w.cert)
 	if err != nil {
 		return res, err
@@ -100,11 +105,6 @@ func (w Wrapper) Block(height *int64) (*ctypes.ResultBlock, error) {
 	}
 	sh := resCommit.SignedHeader
 
-	// now verify
-	err = ValidateBlockMeta(resBlock.BlockMeta, sh)
-	if err != nil {
-		return nil, err
-	}
 	err = ValidateBlock(resBlock.Block, sh)
 	if err != nil {
 		return nil, err
@@ -134,12 +134,65 @@ func (w Wrapper) Commit(height *int64) (*ctypes.ResultCommit, error) {
 	}
 	rpcclient.WaitForHeight(w.Client, *height, nil)
 	res, err := w.Client.Commit(height)
-	// if we got it, then certify it
+	// if we got it, then verify it
 	if err == nil {
 		sh := res.SignedHeader
-		err = w.cert.Certify(sh)
+		err = w.cert.Verify(sh)
 	}
 	return res, err
+}
+
+func (w Wrapper) RegisterOpDecoder(typ string, dec merkle.OpDecoder) {
+	w.prt.RegisterOpDecoder(typ, dec)
+}
+
+// SubscribeWS subscribes for events using the given query and remote address as
+// a subscriber, but does not verify responses (UNSAFE)!
+func (w Wrapper) SubscribeWS(ctx *rpctypes.Context, query string) (*ctypes.ResultSubscribe, error) {
+	out, err := w.Client.Subscribe(context.Background(), ctx.RemoteAddr(), query)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		for {
+			select {
+			case resultEvent := <-out:
+				// XXX(melekes) We should have a switch here that performs a validation
+				// depending on the event's type.
+				ctx.WSConn.TryWriteRPCResponse(
+					rpctypes.NewRPCSuccessResponse(
+						ctx.WSConn.Codec(),
+						ctx.JSONReq.ID,
+						resultEvent,
+					))
+			case <-w.Client.Quit():
+				return
+			}
+		}
+	}()
+
+	return &ctypes.ResultSubscribe{}, nil
+}
+
+// UnsubscribeWS calls original client's Unsubscribe using remote address as a
+// subscriber.
+func (w Wrapper) UnsubscribeWS(ctx *rpctypes.Context, query string) (*ctypes.ResultUnsubscribe, error) {
+	err := w.Client.Unsubscribe(context.Background(), ctx.RemoteAddr(), query)
+	if err != nil {
+		return nil, err
+	}
+	return &ctypes.ResultUnsubscribe{}, nil
+}
+
+// UnsubscribeAllWS calls original client's UnsubscribeAll using remote address
+// as a subscriber.
+func (w Wrapper) UnsubscribeAllWS(ctx *rpctypes.Context) (*ctypes.ResultUnsubscribe, error) {
+	err := w.Client.UnsubscribeAll(context.Background(), ctx.RemoteAddr())
+	if err != nil {
+		return nil, err
+	}
+	return &ctypes.ResultUnsubscribe{}, nil
 }
 
 // // WrappedSwitch creates a websocket connection that auto-verifies any info

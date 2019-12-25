@@ -6,8 +6,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/tendermint/tendermint/config"
-	crypto "github.com/tendermint/tendermint/crypto"
+	"github.com/pkg/errors"
+
+	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/p2p/conn"
 )
 
@@ -25,6 +26,7 @@ type IPResolver interface {
 // accept is the container to carry the upgraded connection and NodeInfo from an
 // asynchronously running routine to the Accept method.
 type accept struct {
+	netAddr  *NetAddress
 	conn     net.Conn
 	nodeInfo NodeInfo
 	err      error
@@ -37,21 +39,32 @@ type accept struct {
 // events.
 // TODO(xla): Refactor out with more static Reactor setup and PeerBehaviour.
 type peerConfig struct {
-	chDescs              []*conn.ChannelDescriptor
-	onPeerError          func(Peer, interface{})
-	outbound, persistent bool
-	reactorsByCh         map[byte]Reactor
+	chDescs     []*conn.ChannelDescriptor
+	onPeerError func(Peer, interface{})
+	outbound    bool
+	// isPersistent allows you to set a function, which, given socket address
+	// (for outbound peers) OR self-reported address (for inbound peers), tells
+	// if the peer is persistent or not.
+	isPersistent func(*NetAddress) bool
+	reactorsByCh map[byte]Reactor
+	metrics      *Metrics
 }
 
 // Transport emits and connects to Peers. The implementation of Peer is left to
 // the transport. Each transport is also responsible to filter establishing
 // peers specific to its domain.
 type Transport interface {
+	// Listening address.
+	NetAddress() NetAddress
+
 	// Accept returns a newly connected Peer.
 	Accept(peerConfig) (Peer, error)
 
 	// Dial connects to the Peer for the address.
 	Dial(NetAddress, peerConfig) (Peer, error)
+
+	// Cleanup any resources associated with Peer.
+	Cleanup(Peer)
 }
 
 // transportLifecycle bundles the methods for callers to control start and stop
@@ -74,7 +87,7 @@ func ConnDuplicateIPFilter() ConnFilterFunc {
 			if cs.HasIP(ip) {
 				return ErrRejected{
 					conn:        c,
-					err:         fmt.Errorf("IP<%v> already connected", ip),
+					err:         fmt.Errorf("ip<%v> already connected", ip),
 					isDuplicate: true,
 				}
 			}
@@ -112,6 +125,7 @@ func MultiplexTransportResolver(resolver IPResolver) MultiplexTransportOption {
 // MultiplexTransport accepts and dials tcp connections and upgrades them to
 // multiplexed peers.
 type MultiplexTransport struct {
+	netAddr  NetAddress
 	listener net.Listener
 
 	acceptc chan accept
@@ -128,11 +142,10 @@ type MultiplexTransport struct {
 	nodeKey          NodeKey
 	resolver         IPResolver
 
-	// TODO(xla): Those configs are still needed as we parameterise peerConn and
+	// TODO(xla): This config is still needed as we parameterise peerConn and
 	// peer currently. All relevant configuration should be refactored into options
 	// with sane defaults.
-	mConfig   conn.MConnConfig
-	p2pConfig config.P2PConfig
+	mConfig conn.MConnConfig
 }
 
 // Test multiplexTransport for interface completeness.
@@ -143,6 +156,7 @@ var _ transportLifecycle = (*MultiplexTransport)(nil)
 func NewMultiplexTransport(
 	nodeInfo NodeInfo,
 	nodeKey NodeKey,
+	mConfig conn.MConnConfig,
 ) *MultiplexTransport {
 	return &MultiplexTransport{
 		acceptc:          make(chan accept),
@@ -150,12 +164,17 @@ func NewMultiplexTransport(
 		dialTimeout:      defaultDialTimeout,
 		filterTimeout:    defaultFilterTimeout,
 		handshakeTimeout: defaultHandshakeTimeout,
-		mConfig:          conn.DefaultMConnConfig(),
+		mConfig:          mConfig,
 		nodeInfo:         nodeInfo,
 		nodeKey:          nodeKey,
 		conns:            NewConnSet(),
 		resolver:         net.DefaultResolver,
 	}
+}
+
+// NetAddress implements Transport.
+func (mt *MultiplexTransport) NetAddress() NetAddress {
+	return mt.netAddr
 }
 
 // Accept implements Transport.
@@ -170,9 +189,9 @@ func (mt *MultiplexTransport) Accept(cfg peerConfig) (Peer, error) {
 
 		cfg.outbound = false
 
-		return mt.wrapPeer(a.conn, a.nodeInfo, cfg), nil
+		return mt.wrapPeer(a.conn, a.nodeInfo, cfg, a.netAddr), nil
 	case <-mt.closec:
-		return nil, &ErrTransportClosed{}
+		return nil, ErrTransportClosed{}
 	}
 }
 
@@ -191,14 +210,14 @@ func (mt *MultiplexTransport) Dial(
 		return nil, err
 	}
 
-	secretConn, nodeInfo, err := mt.upgrade(c)
+	secretConn, nodeInfo, err := mt.upgrade(c, &addr)
 	if err != nil {
 		return nil, err
 	}
 
 	cfg.outbound = true
 
-	p := mt.wrapPeer(secretConn, nodeInfo, cfg)
+	p := mt.wrapPeer(secretConn, nodeInfo, cfg, &addr)
 
 	return p, nil
 }
@@ -207,7 +226,11 @@ func (mt *MultiplexTransport) Dial(
 func (mt *MultiplexTransport) Close() error {
 	close(mt.closec)
 
-	return mt.listener.Close()
+	if mt.listener != nil {
+		return mt.listener.Close()
+	}
+
+	return nil
 }
 
 // Listen implements transportLifecycle.
@@ -217,6 +240,7 @@ func (mt *MultiplexTransport) Listen(addr NetAddress) error {
 		return err
 	}
 
+	mt.netAddr = addr
 	mt.listener = ln
 
 	go mt.acceptPeers()
@@ -248,18 +272,41 @@ func (mt *MultiplexTransport) acceptPeers() {
 		//
 		// [0] https://en.wikipedia.org/wiki/Head-of-line_blocking
 		go func(c net.Conn) {
+			defer func() {
+				if r := recover(); r != nil {
+					err := ErrRejected{
+						conn:          c,
+						err:           errors.Errorf("recovered from panic: %v", r),
+						isAuthFailure: true,
+					}
+					select {
+					case mt.acceptc <- accept{err: err}:
+					case <-mt.closec:
+						// Give up if the transport was closed.
+						_ = c.Close()
+						return
+					}
+				}
+			}()
+
 			var (
 				nodeInfo   NodeInfo
 				secretConn *conn.SecretConnection
+				netAddr    *NetAddress
 			)
 
 			err := mt.filterConn(c)
 			if err == nil {
-				secretConn, nodeInfo, err = mt.upgrade(c)
+				secretConn, nodeInfo, err = mt.upgrade(c, nil)
+				if err == nil {
+					addr := c.RemoteAddr()
+					id := PubKeyToID(secretConn.RemotePubKey())
+					netAddr = NewNetAddress(id, addr)
+				}
 			}
 
 			select {
-			case mt.acceptc <- accept{secretConn, nodeInfo, err}:
+			case mt.acceptc <- accept{netAddr, secretConn, nodeInfo, err}:
 				// Make the upgraded peer available.
 			case <-mt.closec:
 				// Give up if the transport was closed.
@@ -268,6 +315,13 @@ func (mt *MultiplexTransport) acceptPeers() {
 			}
 		}(c)
 	}
+}
+
+// Cleanup removes the given address from the connections set and
+// closes the connection.
+func (mt *MultiplexTransport) Cleanup(p Peer) {
+	mt.conns.RemoveAddr(p.RemoteAddr())
+	_ = p.CloseConn()
 }
 
 func (mt *MultiplexTransport) cleanup(c net.Conn) error {
@@ -321,6 +375,7 @@ func (mt *MultiplexTransport) filterConn(c net.Conn) (err error) {
 
 func (mt *MultiplexTransport) upgrade(
 	c net.Conn,
+	dialedAddr *NetAddress,
 ) (secretConn *conn.SecretConnection, nodeInfo NodeInfo, err error) {
 	defer func() {
 		if err != nil {
@@ -330,16 +385,33 @@ func (mt *MultiplexTransport) upgrade(
 
 	secretConn, err = upgradeSecretConn(c, mt.handshakeTimeout, mt.nodeKey.PrivKey)
 	if err != nil {
-		return nil, NodeInfo{}, ErrRejected{
+		return nil, nil, ErrRejected{
 			conn:          c,
-			err:           fmt.Errorf("secrect conn failed: %v", err),
+			err:           fmt.Errorf("secret conn failed: %v", err),
 			isAuthFailure: true,
+		}
+	}
+
+	// For outgoing conns, ensure connection key matches dialed key.
+	connID := PubKeyToID(secretConn.RemotePubKey())
+	if dialedAddr != nil {
+		if dialedID := dialedAddr.ID; connID != dialedID {
+			return nil, nil, ErrRejected{
+				conn: c,
+				id:   connID,
+				err: fmt.Errorf(
+					"conn.ID (%v) dialed ID (%v) mismatch",
+					connID,
+					dialedID,
+				),
+				isAuthFailure: true,
+			}
 		}
 	}
 
 	nodeInfo, err = handshake(secretConn, mt.handshakeTimeout, mt.nodeInfo)
 	if err != nil {
-		return nil, NodeInfo{}, ErrRejected{
+		return nil, nil, ErrRejected{
 			conn:          c,
 			err:           fmt.Errorf("handshake failed: %v", err),
 			isAuthFailure: true,
@@ -347,7 +419,7 @@ func (mt *MultiplexTransport) upgrade(
 	}
 
 	if err := nodeInfo.Validate(); err != nil {
-		return nil, NodeInfo{}, ErrRejected{
+		return nil, nil, ErrRejected{
 			conn:              c,
 			err:               err,
 			isNodeInfoInvalid: true,
@@ -355,34 +427,34 @@ func (mt *MultiplexTransport) upgrade(
 	}
 
 	// Ensure connection key matches self reported key.
-	if connID := PubKeyToID(secretConn.RemotePubKey()); connID != nodeInfo.ID {
-		return nil, NodeInfo{}, ErrRejected{
+	if connID != nodeInfo.ID() {
+		return nil, nil, ErrRejected{
 			conn: c,
 			id:   connID,
 			err: fmt.Errorf(
-				"conn.ID (%v) NodeInfo.ID (%v) missmatch",
+				"conn.ID (%v) NodeInfo.ID (%v) mismatch",
 				connID,
-				nodeInfo.ID,
+				nodeInfo.ID(),
 			),
 			isAuthFailure: true,
 		}
 	}
 
 	// Reject self.
-	if mt.nodeInfo.ID == nodeInfo.ID {
-		return nil, NodeInfo{}, ErrRejected{
-			addr:   *NewNetAddress(nodeInfo.ID, c.RemoteAddr()),
+	if mt.nodeInfo.ID() == nodeInfo.ID() {
+		return nil, nil, ErrRejected{
+			addr:   *NewNetAddress(nodeInfo.ID(), c.RemoteAddr()),
 			conn:   c,
-			id:     nodeInfo.ID,
+			id:     nodeInfo.ID(),
 			isSelf: true,
 		}
 	}
 
 	if err := mt.nodeInfo.CompatibleWith(nodeInfo); err != nil {
-		return nil, NodeInfo{}, ErrRejected{
+		return nil, nil, ErrRejected{
 			conn:           c,
 			err:            err,
-			id:             nodeInfo.ID,
+			id:             nodeInfo.ID(),
 			isIncompatible: true,
 		}
 	}
@@ -394,26 +466,37 @@ func (mt *MultiplexTransport) wrapPeer(
 	c net.Conn,
 	ni NodeInfo,
 	cfg peerConfig,
+	socketAddr *NetAddress,
 ) Peer {
+
+	persistent := false
+	if cfg.isPersistent != nil {
+		if cfg.outbound {
+			persistent = cfg.isPersistent(socketAddr)
+		} else {
+			selfReportedAddr, err := ni.NetAddress()
+			if err == nil {
+				persistent = cfg.isPersistent(selfReportedAddr)
+			}
+		}
+	}
+
+	peerConn := newPeerConn(
+		cfg.outbound,
+		persistent,
+		c,
+		socketAddr,
+	)
+
 	p := newPeer(
-		peerConn{
-			conn:       c,
-			config:     &mt.p2pConfig,
-			outbound:   cfg.outbound,
-			persistent: cfg.persistent,
-		},
+		peerConn,
 		mt.mConfig,
 		ni,
 		cfg.reactorsByCh,
 		cfg.chDescs,
 		cfg.onPeerError,
+		PeerMetrics(cfg.metrics),
 	)
-
-	// Wait for Peer to Stop so we can cleanup.
-	go func(c net.Conn) {
-		<-p.Quit()
-		_ = mt.cleanup(c)
-	}(c)
 
 	return p
 }
@@ -424,21 +507,22 @@ func handshake(
 	nodeInfo NodeInfo,
 ) (NodeInfo, error) {
 	if err := c.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return NodeInfo{}, err
+		return nil, err
 	}
 
 	var (
 		errc = make(chan error, 2)
 
-		peerNodeInfo NodeInfo
+		peerNodeInfo DefaultNodeInfo
+		ourNodeInfo  = nodeInfo.(DefaultNodeInfo)
 	)
 
 	go func(errc chan<- error, c net.Conn) {
-		_, err := cdc.MarshalBinaryWriter(c, nodeInfo)
+		_, err := cdc.MarshalBinaryLengthPrefixedWriter(c, ourNodeInfo)
 		errc <- err
 	}(errc, c)
 	go func(errc chan<- error, c net.Conn) {
-		_, err := cdc.UnmarshalBinaryReader(
+		_, err := cdc.UnmarshalBinaryLengthPrefixedReader(
 			c,
 			&peerNodeInfo,
 			int64(MaxNodeInfoSize()),
@@ -449,7 +533,7 @@ func handshake(
 	for i := 0; i < cap(errc); i++ {
 		err := <-errc
 		if err != nil {
-			return NodeInfo{}, err
+			return nil, err
 		}
 	}
 

@@ -1,14 +1,18 @@
+---
+order: 5
+---
+
 # Running in production
 
 ## Database
 
-By default, Tendermint uses the `syndtr/goleveldb` package for it's in-process
+By default, Tendermint uses the `syndtr/goleveldb` package for its in-process
 key-value database. Unfortunately, this implementation of LevelDB seems to suffer under heavy load (see
 [#226](https://github.com/syndtr/goleveldb/issues/226)). It may be best to
 install the real C-implementation of LevelDB and compile Tendermint to use
 that using `make build_c`. See the [install instructions](../introduction/install.md) for details.
 
-Tendermint keeps multiple distinct LevelDB databases in the `$TMROOT/data`:
+Tendermint keeps multiple distinct databases in the `$TMROOT/data`:
 
 - `blockstore.db`: Keeps the entire blockchain - stores blocks,
   block commits, and block meta data, each indexed by height. Used to sync new
@@ -17,10 +21,10 @@ Tendermint keeps multiple distinct LevelDB databases in the `$TMROOT/data`:
 - `state.db`: Stores the current blockchain state (ie. height, validators,
   consensus params). Only grows if consensus params or validators change. Also
   used to temporarily store intermediate results during block processing.
-- `tx_index.db`: Indexes txs (and their results) by tx hash and by DeliverTx result tags.
+- `tx_index.db`: Indexes txs (and their results) by tx hash and by DeliverTx result events.
 
 By default, Tendermint will only index txs by their hash, not by their DeliverTx
-result tags. See [indexing transactions](../app-dev/indexing-transactions.md) for
+result events. See [indexing transactions](../app-dev/indexing-transactions.md) for
 details.
 
 There is no current strategy for pruning the databases. Consider reducing
@@ -73,6 +77,10 @@ may never make it into the blockchain if those nodes crash before being able to
 propose it. Clients must monitor their txs by subscribing over websockets,
 polling for them, or using `/broadcast_tx_commit`. In the worst case, txs can be
 resent from the mempool WAL manually.
+
+For the above reasons, the `mempool.wal` is disabled by default. To enable, set
+`mempool.wal_dir` to where you want the WAL to be located (e.g.
+`data/mempool.wal`).
 
 ## DOS Exposure and Mitigation
 
@@ -133,6 +141,19 @@ returns just the votes seen at the current height.
 - [StackOverflow
   questions](https://stackoverflow.com/questions/tagged/tendermint)
 
+### Debug Utility
+
+Tendermint also ships with a `debug` sub-command that allows you to kill a live
+Tendermint process while collecting useful information in a compressed archive
+such as the configuration used, consensus state, network state, the node' status,
+the WAL, and even the stacktrace of the process before exit. These files can be
+useful to examine when debugging a faulty Tendermint process.
+
+In addition, the `debug` sub-command also allows you to dump debugging data into
+compressed archives at a regular interval. These archives contain the goroutine
+and heap profiles in addition to the consensus state, network info, node status,
+and even the WAL.
+
 ## Monitoring Tendermint
 
 Each Tendermint instance has a standard `/health` RPC endpoint, which
@@ -141,10 +162,6 @@ if something is wrong.
 
 Other useful endpoints include mentioned earlier `/status`, `/net_info` and
 `/validators`.
-
-We have a small tool, called `tm-monitor`, which outputs information from
-the endpoints above plus some statistics. The tool can be found
-[here](https://github.com/tendermint/tendermint/tree/master/tools/tm-monitor).
 
 Tendermint also can report and serve Prometheus metrics. See
 [Metrics](./metrics.md).

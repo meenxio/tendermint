@@ -15,15 +15,11 @@ import (
 
 	cfg "github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/libs/cli"
-	cmn "github.com/tendermint/tendermint/libs/common"
+	tmos "github.com/tendermint/tendermint/libs/os"
 )
 
 var (
 	defaultRoot = os.ExpandEnv("$HOME/.some/test/dir")
-)
-
-const (
-	rootName = "root"
 )
 
 // clearConfig clears env vars, the given root dir, and resets viper.
@@ -144,7 +140,7 @@ func TestRootConfig(t *testing.T) {
 
 		// XXX: path must match cfg.defaultConfigPath
 		configFilePath := filepath.Join(defaultRoot, "config")
-		err := cmn.EnsureDir(configFilePath, 0700)
+		err := tmos.EnsureDir(configFilePath, 0700)
 		require.Nil(t, err)
 
 		// write the non-defaults to a different path
@@ -169,7 +165,7 @@ func TestRootConfig(t *testing.T) {
 func WriteConfigVals(dir string, vals map[string]string) error {
 	data := ""
 	for k, v := range vals {
-		data = data + fmt.Sprintf("%s = \"%s\"\n", k, v)
+		data += fmt.Sprintf("%s = \"%s\"\n", k, v)
 	}
 	cfile := filepath.Join(dir, "config.toml")
 	return ioutil.WriteFile(cfile, []byte(data), 0666)

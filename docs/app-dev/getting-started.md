@@ -1,3 +1,7 @@
+---
+order: 1
+---
+
 # Getting Started
 
 ## First Tendermint App
@@ -7,8 +11,7 @@ application you want to run. So, to run a complete blockchain that does
 something useful, you must start two programs: one is Tendermint Core,
 the other is your application, which can be written in any programming
 language. Recall from [the intro to
-ABCI](../introduction/introduction.html#abci-overview) that Tendermint Core handles all
-the p2p and consensus stuff, and just forwards transactions to the
+ABCI](../introduction/what-is-tendermint.md#abci-overview) that Tendermint Core handles all the p2p and consensus stuff, and just forwards transactions to the
 application when they need to be validated, or when they're ready to be
 committed to a block.
 
@@ -18,18 +21,20 @@ using Tendermint.
 ### Install
 
 The first apps we will work with are written in Go. To install them, you
-need to [install Go](https://golang.org/doc/install) and put
-`$GOPATH/bin` in your `$PATH`; see
-[here](https://github.com/tendermint/tendermint/wiki/Setting-GOPATH) for
-more info.
+need to [install Go](https://golang.org/doc/install), put
+`$GOPATH/bin` in your `$PATH` and enable go modules with these instructions:
+```bash
+echo export GOPATH=\"\$HOME/go\" >> ~/.bash_profile
+echo export PATH=\"\$PATH:\$GOPATH/bin\" >> ~/.bash_profile
+echo export GO111MODULE=on >> ~/.bash_profile
+```
 
 Then run
 
 ```
 go get github.com/tendermint/tendermint
 cd $GOPATH/src/github.com/tendermint/tendermint
-make get_tools
-make get_vendor_deps
+make tools
 make install_abci
 ```
 
@@ -53,8 +58,10 @@ Let's start a kvstore application.
 abci-cli kvstore
 ```
 
-In another terminal, we can start Tendermint. If you have never run
-Tendermint before, use:
+In another terminal, we can start Tendermint. You should already have the 
+Tendermint binary installed. If not, follow the steps from 
+[here](../introduction/install.md). If you have never run Tendermint 
+before, use:
 
 ```
 tendermint init
@@ -139,7 +146,7 @@ The result should look like:
 Note the `value` in the result (`YWJjZA==`); this is the base64-encoding
 of the ASCII of `abcd`. You can verify this in a python 2 shell by
 running `"YWJjZA==".decode('base64')` or in python 3 shell by running
-`import codecs; codecs.decode("YWJjZA==", 'base64').decode('ascii')`.
+`import codecs; codecs.decode(b"YWJjZA==", 'base64').decode('ascii')`.
 Stay tuned for a future release that [makes this output more
 human-readable](https://github.com/tendermint/tendermint/issues/1794).
 
@@ -253,14 +260,12 @@ we'll run a Javascript version of the `counter`. To run it, you'll need
 to [install node](https://nodejs.org/en/download/).
 
 You'll also need to fetch the relevant repository, from
-[here](https://github.com/tendermint/js-abci) then install it. As go
-devs, we keep all our code under the `$GOPATH`, so run:
+[here](https://github.com/tendermint/js-abci), then install it:
 
 ```
-go get github.com/tendermint/js-abci &> /dev/null
-cd $GOPATH/src/github.com/tendermint/js-abci/example
-npm install
-cd ..
+git clone https://github.com/tendermint/js-abci.git
+cd js-abci
+npm install abci
 ```
 
 Kill the previous `counter` and `tendermint` processes. Now run the app:
@@ -277,13 +282,16 @@ tendermint node
 ```
 
 Once again, you should see blocks streaming by - but now, our
-application is written in javascript! Try sending some transactions, and
+application is written in Javascript! Try sending some transactions, and
 like before - the results should be the same:
 
 ```
-curl localhost:26657/broadcast_tx_commit?tx=0x00 # ok
-curl localhost:26657/broadcast_tx_commit?tx=0x05 # invalid nonce
-curl localhost:26657/broadcast_tx_commit?tx=0x01 # ok
+# ok
+curl localhost:26657/broadcast_tx_commit?tx=0x00
+# invalid nonce
+curl localhost:26657/broadcast_tx_commit?tx=0x05
+# ok
+curl localhost:26657/broadcast_tx_commit?tx=0x01
 ```
 
 Neat, eh?

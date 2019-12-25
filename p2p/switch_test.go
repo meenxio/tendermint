@@ -2,11 +2,21 @@ package p2p
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -111,10 +121,10 @@ func TestSwitches(t *testing.T) {
 	defer s2.Stop()
 
 	if s1.Peers().Size() != 1 {
-		t.Errorf("Expected exactly 1 peer in s1, got %v", s1.Peers().Size())
+		t.Errorf("expected exactly 1 peer in s1, got %v", s1.Peers().Size())
 	}
 	if s2.Peers().Size() != 1 {
-		t.Errorf("Expected exactly 1 peer in s2, got %v", s2.Peers().Size())
+		t.Errorf("expected exactly 1 peer in s2, got %v", s2.Peers().Size())
 	}
 
 	// Lets send some messages
@@ -126,12 +136,28 @@ func TestSwitches(t *testing.T) {
 	s1.Broadcast(byte(0x01), ch1Msg)
 	s1.Broadcast(byte(0x02), ch2Msg)
 
-	assertMsgReceivedWithTimeout(t, ch0Msg, byte(0x00), s2.Reactor("foo").(*TestReactor), 10*time.Millisecond, 5*time.Second)
-	assertMsgReceivedWithTimeout(t, ch1Msg, byte(0x01), s2.Reactor("foo").(*TestReactor), 10*time.Millisecond, 5*time.Second)
-	assertMsgReceivedWithTimeout(t, ch2Msg, byte(0x02), s2.Reactor("bar").(*TestReactor), 10*time.Millisecond, 5*time.Second)
+	assertMsgReceivedWithTimeout(t,
+		ch0Msg,
+		byte(0x00),
+		s2.Reactor("foo").(*TestReactor), 10*time.Millisecond, 5*time.Second)
+	assertMsgReceivedWithTimeout(t,
+		ch1Msg,
+		byte(0x01),
+		s2.Reactor("foo").(*TestReactor), 10*time.Millisecond, 5*time.Second)
+	assertMsgReceivedWithTimeout(t,
+		ch2Msg,
+		byte(0x02),
+		s2.Reactor("bar").(*TestReactor), 10*time.Millisecond, 5*time.Second)
 }
 
-func assertMsgReceivedWithTimeout(t *testing.T, msgBytes []byte, channel byte, reactor *TestReactor, checkPeriod, timeout time.Duration) {
+func assertMsgReceivedWithTimeout(
+	t *testing.T,
+	msgBytes []byte,
+	channel byte,
+	reactor *TestReactor,
+	checkPeriod,
+	timeout time.Duration,
+) {
 	ticker := time.NewTicker(checkPeriod)
 	for {
 		select {
@@ -143,6 +169,7 @@ func assertMsgReceivedWithTimeout(t *testing.T, msgBytes []byte, channel byte, r
 				}
 				return
 			}
+
 		case <-time.After(timeout):
 			t.Fatalf("Expected to have received 1 message in channel #%v, got zero", channel)
 		}
@@ -151,17 +178,13 @@ func assertMsgReceivedWithTimeout(t *testing.T, msgBytes []byte, channel byte, r
 
 func TestSwitchFiltersOutItself(t *testing.T) {
 	s1 := MakeSwitch(cfg, 1, "127.0.0.1", "123.123.123", initSwitchFunc)
-	// addr := s1.NodeInfo().NetAddress()
-
-	// // add ourselves like we do in node.go#427
-	// s1.addrBook.AddOurAddress(addr)
 
 	// simulate s1 having a public IP by creating a remote peer with the same ID
 	rp := &remotePeer{PrivKey: s1.nodeKey.PrivKey, Config: cfg}
 	rp.Start()
 
 	// addr should be rejected in addPeer based on the same ID
-	err := s1.DialPeerWithAddress(rp.Addr(), false)
+	err := s1.DialPeerWithAddress(rp.Addr())
 	if assert.Error(t, err) {
 		if err, ok := err.(ErrRejected); ok {
 			if !err.IsSelf() {
@@ -184,7 +207,7 @@ func TestSwitchPeerFilter(t *testing.T) {
 	var (
 		filters = []PeerFilterFunc{
 			func(_ IPeerSet, _ Peer) error { return nil },
-			func(_ IPeerSet, _ Peer) error { return fmt.Errorf("denied!") },
+			func(_ IPeerSet, _ Peer) error { return fmt.Errorf("denied") },
 			func(_ IPeerSet, _ Peer) error { return nil },
 		}
 		sw = MakeSwitch(
@@ -206,6 +229,7 @@ func TestSwitchPeerFilter(t *testing.T) {
 	p, err := sw.transport.Dial(*rp.Addr(), peerConfig{
 		chDescs:      sw.chDescs,
 		onPeerError:  sw.StopPeerForError,
+		isPersistent: sw.IsPeerPersistent,
 		reactorsByCh: sw.reactorsByCh,
 	})
 	if err != nil {
@@ -250,6 +274,7 @@ func TestSwitchPeerFilterTimeout(t *testing.T) {
 	p, err := sw.transport.Dial(*rp.Addr(), peerConfig{
 		chDescs:      sw.chDescs,
 		onPeerError:  sw.StopPeerForError,
+		isPersistent: sw.IsPeerPersistent,
 		reactorsByCh: sw.reactorsByCh,
 	})
 	if err != nil {
@@ -264,6 +289,8 @@ func TestSwitchPeerFilterTimeout(t *testing.T) {
 
 func TestSwitchPeerFilterDuplicate(t *testing.T) {
 	sw := MakeSwitch(cfg, 1, "testing", "123.123.123", initSwitchFunc)
+	sw.Start()
+	defer sw.Stop()
 
 	// simulate remote peer
 	rp := &remotePeer{PrivKey: ed25519.GenPrivKey(), Config: cfg}
@@ -273,6 +300,7 @@ func TestSwitchPeerFilterDuplicate(t *testing.T) {
 	p, err := sw.transport.Dial(*rp.Addr(), peerConfig{
 		chDescs:      sw.chDescs,
 		onPeerError:  sw.StopPeerForError,
+		isPersistent: sw.IsPeerPersistent,
 		reactorsByCh: sw.reactorsByCh,
 	})
 	if err != nil {
@@ -284,12 +312,12 @@ func TestSwitchPeerFilterDuplicate(t *testing.T) {
 	}
 
 	err = sw.addPeer(p)
-	if err, ok := err.(ErrRejected); ok {
-		if !err.IsDuplicate() {
-			t.Errorf("expected peer to be duplicate")
+	if errRej, ok := err.(ErrRejected); ok {
+		if !errRej.IsDuplicate() {
+			t.Errorf("expected peer to be duplicate. got %v", errRej)
 		}
 	} else {
-		t.Errorf("expected ErrRejected")
+		t.Errorf("expected ErrRejected, got %v", err)
 	}
 }
 
@@ -318,6 +346,7 @@ func TestSwitchStopsNonPersistentPeerOnError(t *testing.T) {
 	p, err := sw.transport.Dial(*rp.Addr(), peerConfig{
 		chDescs:      sw.chDescs,
 		onPeerError:  sw.StopPeerForError,
+		isPersistent: sw.IsPeerPersistent,
 		reactorsByCh: sw.reactorsByCh,
 	})
 	require.Nil(err)
@@ -334,49 +363,82 @@ func TestSwitchStopsNonPersistentPeerOnError(t *testing.T) {
 	assert.False(p.IsRunning())
 }
 
-func TestSwitchReconnectsToPersistentPeer(t *testing.T) {
-	assert, require := assert.New(t), require.New(t)
+func TestSwitchStopPeerForError(t *testing.T) {
+	s := httptest.NewServer(promhttp.Handler())
+	defer s.Close()
 
+	scrapeMetrics := func() string {
+		resp, err := http.Get(s.URL)
+		assert.NoError(t, err)
+		defer resp.Body.Close()
+		buf, _ := ioutil.ReadAll(resp.Body)
+		return string(buf)
+	}
+
+	namespace, subsystem, name := config.TestInstrumentationConfig().Namespace, MetricsSubsystem, "peers"
+	re := regexp.MustCompile(namespace + `_` + subsystem + `_` + name + ` ([0-9\.]+)`)
+	peersMetricValue := func() float64 {
+		matches := re.FindStringSubmatch(scrapeMetrics())
+		f, _ := strconv.ParseFloat(matches[1], 64)
+		return f
+	}
+
+	p2pMetrics := PrometheusMetrics(namespace)
+
+	// make two connected switches
+	sw1, sw2 := MakeSwitchPair(t, func(i int, sw *Switch) *Switch {
+		// set metrics on sw1
+		if i == 0 {
+			opt := WithMetrics(p2pMetrics)
+			opt(sw)
+		}
+		return initSwitchFunc(i, sw)
+	})
+
+	assert.Equal(t, len(sw1.Peers().List()), 1)
+	assert.EqualValues(t, 1, peersMetricValue())
+
+	// send messages to the peer from sw1
+	p := sw1.Peers().List()[0]
+	p.Send(0x1, []byte("here's a message to send"))
+
+	// stop sw2. this should cause the p to fail,
+	// which results in calling StopPeerForError internally
+	sw2.Stop()
+
+	// now call StopPeerForError explicitly, eg. from a reactor
+	sw1.StopPeerForError(p, fmt.Errorf("some err"))
+
+	assert.Equal(t, len(sw1.Peers().List()), 0)
+	assert.EqualValues(t, 0, peersMetricValue())
+}
+
+func TestSwitchReconnectsToOutboundPersistentPeer(t *testing.T) {
 	sw := MakeSwitch(cfg, 1, "testing", "123.123.123", initSwitchFunc)
 	err := sw.Start()
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	defer sw.Stop()
 
-	// simulate remote peer
+	// 1. simulate failure by closing connection
 	rp := &remotePeer{PrivKey: ed25519.GenPrivKey(), Config: cfg}
 	rp.Start()
 	defer rp.Stop()
 
-	p, err := sw.transport.Dial(*rp.Addr(), peerConfig{
-		chDescs:      sw.chDescs,
-		onPeerError:  sw.StopPeerForError,
-		persistent:   true,
-		reactorsByCh: sw.reactorsByCh,
-	})
-	require.Nil(err)
+	err = sw.AddPersistentPeers([]string{rp.Addr().String()})
+	require.NoError(t, err)
 
-	require.Nil(sw.addPeer(p))
+	err = sw.DialPeerWithAddress(rp.Addr())
+	require.Nil(t, err)
+	require.NotNil(t, sw.Peers().Get(rp.ID()))
 
-	require.NotNil(sw.Peers().Get(rp.ID()))
-
-	// simulate failure by closing connection
+	p := sw.Peers().List()[0]
 	p.(*peer).CloseConn()
 
-	// TODO: remove sleep, detect the disconnection, wait for reconnect
-	npeers := sw.Peers().Size()
-	for i := 0; i < 20; i++ {
-		time.Sleep(250 * time.Millisecond)
-		npeers = sw.Peers().Size()
-		if npeers > 0 {
-			break
-		}
-	}
-	assert.NotZero(npeers)
-	assert.False(p.IsRunning())
+	waitUntilSwitchHasAtLeastNPeers(sw, 1)
+	assert.False(t, p.IsRunning())        // old peer instance
+	assert.Equal(t, 1, sw.Peers().Size()) // new peer instance
 
-	// simulate another remote peer
+	// 2. simulate first time dial failure
 	rp = &remotePeer{
 		PrivKey: ed25519.GenPrivKey(),
 		Config:  cfg,
@@ -387,23 +449,68 @@ func TestSwitchReconnectsToPersistentPeer(t *testing.T) {
 	rp.Start()
 	defer rp.Stop()
 
-	// simulate first time dial failure
 	conf := config.DefaultP2PConfig()
-	conf.TestDialFail = true
-	err = sw.addOutboundPeerWithConfig(rp.Addr(), conf, true)
-	require.NotNil(err)
-
+	conf.TestDialFail = true // will trigger a reconnect
+	err = sw.addOutboundPeerWithConfig(rp.Addr(), conf)
+	require.NotNil(t, err)
 	// DialPeerWithAddres - sw.peerConfig resets the dialer
+	waitUntilSwitchHasAtLeastNPeers(sw, 2)
+	assert.Equal(t, 2, sw.Peers().Size())
+}
 
-	// TODO: same as above
+func TestSwitchReconnectsToInboundPersistentPeer(t *testing.T) {
+	sw := MakeSwitch(cfg, 1, "testing", "123.123.123", initSwitchFunc)
+	err := sw.Start()
+	require.NoError(t, err)
+	defer sw.Stop()
+
+	// 1. simulate failure by closing the connection
+	rp := &remotePeer{PrivKey: ed25519.GenPrivKey(), Config: cfg}
+	rp.Start()
+	defer rp.Stop()
+
+	err = sw.AddPersistentPeers([]string{rp.Addr().String()})
+	require.NoError(t, err)
+
+	conn, err := rp.Dial(sw.NetAddress())
+	require.NoError(t, err)
+	time.Sleep(50 * time.Millisecond)
+	require.NotNil(t, sw.Peers().Get(rp.ID()))
+
+	conn.Close()
+
+	waitUntilSwitchHasAtLeastNPeers(sw, 1)
+	assert.Equal(t, 1, sw.Peers().Size())
+}
+
+func TestSwitchDialPeersAsync(t *testing.T) {
+	if testing.Short() {
+		return
+	}
+
+	sw := MakeSwitch(cfg, 1, "testing", "123.123.123", initSwitchFunc)
+	err := sw.Start()
+	require.NoError(t, err)
+	defer sw.Stop()
+
+	rp := &remotePeer{PrivKey: ed25519.GenPrivKey(), Config: cfg}
+	rp.Start()
+	defer rp.Stop()
+
+	err = sw.DialPeersAsync([]string{rp.Addr().String()})
+	require.NoError(t, err)
+	time.Sleep(dialRandomizerIntervalMilliseconds * time.Millisecond)
+	require.NotNil(t, sw.Peers().Get(rp.ID()))
+}
+
+func waitUntilSwitchHasAtLeastNPeers(sw *Switch, n int) {
 	for i := 0; i < 20; i++ {
 		time.Sleep(250 * time.Millisecond)
-		npeers = sw.Peers().Size()
-		if npeers > 1 {
+		has := sw.Peers().Size()
+		if has >= n {
 			break
 		}
 	}
-	assert.EqualValues(2, npeers)
 }
 
 func TestSwitchFullConnectivity(t *testing.T) {
@@ -419,6 +526,200 @@ func TestSwitchFullConnectivity(t *testing.T) {
 			t.Fatalf("Expected each switch to be connected to 2 other, but %d switch only connected to %d", sw.Peers().Size(), i)
 		}
 	}
+}
+
+func TestSwitchAcceptRoutine(t *testing.T) {
+	cfg.MaxNumInboundPeers = 5
+
+	// Create some unconditional peers.
+	const unconditionalPeersNum = 2
+	var (
+		unconditionalPeers   = make([]*remotePeer, unconditionalPeersNum)
+		unconditionalPeerIDs = make([]string, unconditionalPeersNum)
+	)
+	for i := 0; i < unconditionalPeersNum; i++ {
+		peer := &remotePeer{PrivKey: ed25519.GenPrivKey(), Config: cfg}
+		peer.Start()
+		unconditionalPeers[i] = peer
+		unconditionalPeerIDs[i] = string(peer.ID())
+	}
+
+	// make switch
+	sw := MakeSwitch(cfg, 1, "testing", "123.123.123", initSwitchFunc)
+	sw.AddUnconditionalPeerIDs(unconditionalPeerIDs)
+	err := sw.Start()
+	require.NoError(t, err)
+	defer sw.Stop()
+
+	// 0. check there are no peers
+	assert.Equal(t, 0, sw.Peers().Size())
+
+	// 1. check we connect up to MaxNumInboundPeers
+	peers := make([]*remotePeer, 0)
+	for i := 0; i < cfg.MaxNumInboundPeers; i++ {
+		peer := &remotePeer{PrivKey: ed25519.GenPrivKey(), Config: cfg}
+		peers = append(peers, peer)
+		peer.Start()
+		c, err := peer.Dial(sw.NetAddress())
+		require.NoError(t, err)
+		// spawn a reading routine to prevent connection from closing
+		go func(c net.Conn) {
+			for {
+				one := make([]byte, 1)
+				_, err := c.Read(one)
+				if err != nil {
+					return
+				}
+			}
+		}(c)
+	}
+	time.Sleep(10 * time.Millisecond)
+	assert.Equal(t, cfg.MaxNumInboundPeers, sw.Peers().Size())
+
+	// 2. check we close new connections if we already have MaxNumInboundPeers peers
+	peer := &remotePeer{PrivKey: ed25519.GenPrivKey(), Config: cfg}
+	peer.Start()
+	conn, err := peer.Dial(sw.NetAddress())
+	require.NoError(t, err)
+	// check conn is closed
+	one := make([]byte, 1)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	_, err = conn.Read(one)
+	assert.Equal(t, io.EOF, err)
+	assert.Equal(t, cfg.MaxNumInboundPeers, sw.Peers().Size())
+	peer.Stop()
+
+	// 3. check we connect to unconditional peers despite the limit.
+	for _, peer := range unconditionalPeers {
+		c, err := peer.Dial(sw.NetAddress())
+		require.NoError(t, err)
+		// spawn a reading routine to prevent connection from closing
+		go func(c net.Conn) {
+			for {
+				one := make([]byte, 1)
+				_, err := c.Read(one)
+				if err != nil {
+					return
+				}
+			}
+		}(c)
+	}
+	time.Sleep(10 * time.Millisecond)
+	assert.Equal(t, cfg.MaxNumInboundPeers+unconditionalPeersNum, sw.Peers().Size())
+
+	for _, peer := range peers {
+		peer.Stop()
+	}
+	for _, peer := range unconditionalPeers {
+		peer.Stop()
+	}
+}
+
+type errorTransport struct {
+	acceptErr error
+}
+
+func (et errorTransport) NetAddress() NetAddress {
+	panic("not implemented")
+}
+
+func (et errorTransport) Accept(c peerConfig) (Peer, error) {
+	return nil, et.acceptErr
+}
+func (errorTransport) Dial(NetAddress, peerConfig) (Peer, error) {
+	panic("not implemented")
+}
+func (errorTransport) Cleanup(Peer) {
+	panic("not implemented")
+}
+
+func TestSwitchAcceptRoutineErrorCases(t *testing.T) {
+	sw := NewSwitch(cfg, errorTransport{ErrFilterTimeout{}})
+	assert.NotPanics(t, func() {
+		err := sw.Start()
+		assert.NoError(t, err)
+		sw.Stop()
+	})
+
+	sw = NewSwitch(cfg, errorTransport{ErrRejected{conn: nil, err: errors.New("filtered"), isFiltered: true}})
+	assert.NotPanics(t, func() {
+		err := sw.Start()
+		assert.NoError(t, err)
+		sw.Stop()
+	})
+	// TODO(melekes) check we remove our address from addrBook
+
+	sw = NewSwitch(cfg, errorTransport{ErrTransportClosed{}})
+	assert.NotPanics(t, func() {
+		err := sw.Start()
+		assert.NoError(t, err)
+		sw.Stop()
+	})
+}
+
+// mockReactor checks that InitPeer never called before RemovePeer. If that's
+// not true, InitCalledBeforeRemoveFinished will return true.
+type mockReactor struct {
+	*BaseReactor
+
+	// atomic
+	removePeerInProgress           uint32
+	initCalledBeforeRemoveFinished uint32
+}
+
+func (r *mockReactor) RemovePeer(peer Peer, reason interface{}) {
+	atomic.StoreUint32(&r.removePeerInProgress, 1)
+	defer atomic.StoreUint32(&r.removePeerInProgress, 0)
+	time.Sleep(100 * time.Millisecond)
+}
+
+func (r *mockReactor) InitPeer(peer Peer) Peer {
+	if atomic.LoadUint32(&r.removePeerInProgress) == 1 {
+		atomic.StoreUint32(&r.initCalledBeforeRemoveFinished, 1)
+	}
+
+	return peer
+}
+
+func (r *mockReactor) InitCalledBeforeRemoveFinished() bool {
+	return atomic.LoadUint32(&r.initCalledBeforeRemoveFinished) == 1
+}
+
+// see stopAndRemovePeer
+func TestSwitchInitPeerIsNotCalledBeforeRemovePeer(t *testing.T) {
+	// make reactor
+	reactor := &mockReactor{}
+	reactor.BaseReactor = NewBaseReactor("mockReactor", reactor)
+
+	// make switch
+	sw := MakeSwitch(cfg, 1, "testing", "123.123.123", func(i int, sw *Switch) *Switch {
+		sw.AddReactor("mock", reactor)
+		return sw
+	})
+	err := sw.Start()
+	require.NoError(t, err)
+	defer sw.Stop()
+
+	// add peer
+	rp := &remotePeer{PrivKey: ed25519.GenPrivKey(), Config: cfg}
+	rp.Start()
+	defer rp.Stop()
+	_, err = rp.Dial(sw.NetAddress())
+	require.NoError(t, err)
+	// wait till the switch adds rp to the peer set
+	time.Sleep(50 * time.Millisecond)
+
+	// stop peer asynchronously
+	go sw.StopPeerForError(sw.Peers().Get(rp.ID()), "test")
+
+	// simulate peer reconnecting to us
+	_, err = rp.Dial(sw.NetAddress())
+	require.NoError(t, err)
+	// wait till the switch adds rp to the peer set
+	time.Sleep(50 * time.Millisecond)
+
+	// make sure reactor.RemovePeer is finished before InitPeer is called
+	assert.False(t, reactor.InitCalledBeforeRemoveFinished())
 }
 
 func BenchmarkSwitchBroadcast(b *testing.B) {
@@ -476,7 +777,7 @@ func (book *addrBookMock) OurAddress(addr *NetAddress) bool {
 	_, ok := book.ourAddrs[addr.String()]
 	return ok
 }
-func (book *addrBookMock) MarkGood(*NetAddress) {}
+func (book *addrBookMock) MarkGood(ID) {}
 func (book *addrBookMock) HasAddress(addr *NetAddress) bool {
 	_, ok := book.addrs[addr.String()]
 	return ok

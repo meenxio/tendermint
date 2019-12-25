@@ -60,9 +60,10 @@ func (l tmfmtLogger) Log(keyvals ...interface{}) error {
 
 	for i := 0; i < len(keyvals)-1; i += 2 {
 		// Extract level
-		if keyvals[i] == kitlevel.Key() {
+		switch keyvals[i] {
+		case kitlevel.Key():
 			excludeIndexes = append(excludeIndexes, i)
-			switch keyvals[i+1].(type) {
+			switch keyvals[i+1].(type) { // nolint:gocritic
 			case string:
 				lvl = keyvals[i+1].(string)
 			case kitlevel.Value:
@@ -71,11 +72,11 @@ func (l tmfmtLogger) Log(keyvals ...interface{}) error {
 				panic(fmt.Sprintf("level value of unknown type %T", keyvals[i+1]))
 			}
 			// and message
-		} else if keyvals[i] == msgKey {
+		case msgKey:
 			excludeIndexes = append(excludeIndexes, i)
 			msg = keyvals[i+1].(string)
 			// and module (could be multiple keyvals; if such case last keyvalue wins)
-		} else if keyvals[i] == moduleKey {
+		case moduleKey:
 			excludeIndexes = append(excludeIndexes, i)
 			module = keyvals[i+1].(string)
 		}
@@ -84,13 +85,13 @@ func (l tmfmtLogger) Log(keyvals ...interface{}) error {
 	// Form a custom Tendermint line
 	//
 	// Example:
-	//     D[05-02|11:06:44.322] Stopping AddrBook (ignoring: already stopped)
+	//     D[2016-05-02|11:06:44.322]   Stopping AddrBook (ignoring: already stopped)
 	//
 	// Description:
 	//     D										- first character of the level, uppercase (ASCII only)
-	//     [05-02|11:06:44.322] - our time format (see https://golang.org/src/time/format.go)
+	//     [2016-05-02|11:06:44.322]    - our time format (see https://golang.org/src/time/format.go)
 	//     Stopping ...					- message
-	enc.buf.WriteString(fmt.Sprintf("%c[%s] %-44s ", lvl[0]-32, time.Now().Format("01-02|15:04:05.000"), msg))
+	enc.buf.WriteString(fmt.Sprintf("%c[%s] %-44s ", lvl[0]-32, time.Now().Format("2006-01-02|15:04:05.000"), msg))
 
 	if module != unknown {
 		enc.buf.WriteString("module=" + module + " ")

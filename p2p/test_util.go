@@ -5,16 +5,32 @@ import (
 	"net"
 	"time"
 
-	crypto "github.com/tendermint/tendermint/crypto"
+	"github.com/pkg/errors"
+
+	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/crypto/ed25519"
-	cmn "github.com/tendermint/tendermint/libs/common"
 	"github.com/tendermint/tendermint/libs/log"
+	tmnet "github.com/tendermint/tendermint/libs/net"
+	tmrand "github.com/tendermint/tendermint/libs/rand"
 
 	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/p2p/conn"
 )
 
-func AddPeerToSwitch(sw *Switch, peer Peer) {
+const testCh = 0x01
+
+//------------------------------------------------
+
+type mockNodeInfo struct {
+	addr *NetAddress
+}
+
+func (ni mockNodeInfo) ID() ID                              { return ni.addr.ID }
+func (ni mockNodeInfo) NetAddress() (*NetAddress, error)    { return ni.addr, nil }
+func (ni mockNodeInfo) Validate() error                     { return nil }
+func (ni mockNodeInfo) CompatibleWith(other NodeInfo) error { return nil }
+
+func AddPeerToSwitchPeerSet(sw *Switch, peer Peer) {
 	sw.peers.Add(peer)
 }
 
@@ -22,13 +38,12 @@ func CreateRandomPeer(outbound bool) *peer {
 	addr, netAddr := CreateRoutableAddr()
 	p := &peer{
 		peerConn: peerConn{
-			outbound: outbound,
+			outbound:   outbound,
+			socketAddr: netAddr,
 		},
-		nodeInfo: NodeInfo{
-			ID:         netAddr.ID,
-			ListenAddr: netAddr.DialString(),
-		},
-		mconn: &conn.MConnection{},
+		nodeInfo: mockNodeInfo{netAddr},
+		mconn:    &conn.MConnection{},
+		metrics:  NopMetrics(),
 	}
 	p.SetLogger(log.TestingLogger().With("peer", addr))
 	return p
@@ -37,7 +52,12 @@ func CreateRandomPeer(outbound bool) *peer {
 func CreateRoutableAddr() (addr string, netAddr *NetAddress) {
 	for {
 		var err error
-		addr = fmt.Sprintf("%X@%v.%v.%v.%v:26656", cmn.RandBytes(20), cmn.RandInt()%256, cmn.RandInt()%256, cmn.RandInt()%256, cmn.RandInt()%256)
+		addr = fmt.Sprintf("%X@%v.%v.%v.%v:26656",
+			tmrand.Bytes(20),
+			tmrand.Int()%256,
+			tmrand.Int()%256,
+			tmrand.Int()%256,
+			tmrand.Int()%256)
 		netAddr, err = NewNetAddressString(addr)
 		if err != nil {
 			panic(err)
@@ -52,16 +72,20 @@ func CreateRoutableAddr() (addr string, netAddr *NetAddress) {
 //------------------------------------------------------------------
 // Connects switches via arbitrary net.Conn. Used for testing.
 
-const TEST_HOST = "localhost"
+const TestHost = "localhost"
 
 // MakeConnectedSwitches returns n switches, connected according to the connect func.
 // If connect==Connect2Switches, the switches will be fully connected.
 // initSwitch defines how the i'th switch should be initialized (ie. with what reactors).
 // NOTE: panics if any switch fails to start.
-func MakeConnectedSwitches(cfg *config.P2PConfig, n int, initSwitch func(int, *Switch) *Switch, connect func([]*Switch, int, int)) []*Switch {
+func MakeConnectedSwitches(cfg *config.P2PConfig,
+	n int,
+	initSwitch func(int, *Switch) *Switch,
+	connect func([]*Switch, int, int),
+) []*Switch {
 	switches := make([]*Switch, n)
 	for i := 0; i < n; i++ {
-		switches[i] = MakeSwitch(cfg, i, TEST_HOST, "123.123.123", initSwitch)
+		switches[i] = MakeSwitch(cfg, i, TestHost, "123.123.123", initSwitch)
 	}
 
 	if err := StartSwitches(switches); err != nil {
@@ -114,7 +138,7 @@ func (sw *Switch) addPeerWithConnection(conn net.Conn) error {
 		return err
 	}
 
-	ni, err := handshake(conn, 50*time.Millisecond, sw.nodeInfo)
+	ni, err := handshake(conn, time.Second, sw.nodeInfo)
 	if err != nil {
 		if err := conn.Close(); err != nil {
 			sw.Logger.Error("Error closing connection", "err", err)
@@ -124,7 +148,7 @@ func (sw *Switch) addPeerWithConnection(conn net.Conn) error {
 
 	p := newPeer(
 		pc,
-		sw.mConfig,
+		MConnConfig(sw.config),
 		ni,
 		sw.reactorsByCh,
 		sw.chDescs,
@@ -158,35 +182,19 @@ func MakeSwitch(
 	initSwitch func(int, *Switch) *Switch,
 	opts ...SwitchOption,
 ) *Switch {
-	var (
-		nodeKey = NodeKey{
-			PrivKey: ed25519.GenPrivKey(),
-		}
-		ni = NodeInfo{
-			ID:         nodeKey.ID(),
-			Moniker:    fmt.Sprintf("switch%d", i),
-			Network:    network,
-			Version:    version,
-			ListenAddr: fmt.Sprintf("127.0.0.1:%d", cmn.RandIntn(64512)+1023),
-			Other: NodeInfoOther{
-				AminoVersion:     "1.0",
-				P2PVersion:       "1.0",
-				ConsensusVersion: "1.0",
-				RPCVersion:       "1.0",
-				TxIndex:          "off",
-				RPCAddress:       fmt.Sprintf("127.0.0.1:%d", cmn.RandIntn(64512)+1023),
-			},
-		}
-	)
 
-	addr, err := NewNetAddressStringWithOptionalID(
-		IDAddressString(nodeKey.ID(), ni.ListenAddr),
+	nodeKey := NodeKey{
+		PrivKey: ed25519.GenPrivKey(),
+	}
+	nodeInfo := testNodeInfo(nodeKey.ID(), fmt.Sprintf("node%d", i))
+	addr, err := NewNetAddressString(
+		IDAddressString(nodeKey.ID(), nodeInfo.(DefaultNodeInfo).ListenAddr),
 	)
 	if err != nil {
 		panic(err)
 	}
 
-	t := NewMultiplexTransport(ni, nodeKey)
+	t := NewMultiplexTransport(nodeInfo, nodeKey, MConnConfig(cfg))
 
 	if err := t.Listen(*addr); err != nil {
 		panic(err)
@@ -194,17 +202,19 @@ func MakeSwitch(
 
 	// TODO: let the config be passed in?
 	sw := initSwitch(i, NewSwitch(cfg, t, opts...))
-	sw.SetLogger(log.TestingLogger())
+	sw.SetLogger(log.TestingLogger().With("switch", i))
 	sw.SetNodeKey(&nodeKey)
 
+	ni := nodeInfo.(DefaultNodeInfo)
 	for ch := range sw.reactorsByCh {
 		ni.Channels = append(ni.Channels, ch)
 	}
+	nodeInfo = ni
 
 	// TODO: We need to setup reactors ahead of time so the NodeInfo is properly
 	// populated and we don't have to do those awkward overrides and setters.
-	t.nodeInfo = ni
-	sw.SetNodeInfo(ni)
+	t.nodeInfo = nodeInfo
+	sw.SetNodeInfo(nodeInfo)
 
 	return sw
 }
@@ -222,7 +232,7 @@ func testPeerConn(
 	cfg *config.P2PConfig,
 	outbound, persistent bool,
 	ourNodePrivKey crypto.PrivKey,
-	originalAddr *NetAddress,
+	socketAddr *NetAddress,
 ) (pc peerConn, err error) {
 	conn := rawConn
 
@@ -235,15 +245,40 @@ func testPeerConn(
 	// Encrypt connection
 	conn, err = upgradeSecretConn(conn, cfg.HandshakeTimeout, ourNodePrivKey)
 	if err != nil {
-		return pc, cmn.ErrorWrap(err, "Error creating peer")
+		return pc, errors.Wrap(err, "Error creating peer")
 	}
 
 	// Only the information we already have
-	return peerConn{
-		config:       cfg,
-		outbound:     outbound,
-		persistent:   persistent,
-		conn:         conn,
-		originalAddr: originalAddr,
-	}, nil
+	return newPeerConn(outbound, persistent, conn, socketAddr), nil
+}
+
+//----------------------------------------------------------------
+// rand node info
+
+func testNodeInfo(id ID, name string) NodeInfo {
+	return testNodeInfoWithNetwork(id, name, "testing")
+}
+
+func testNodeInfoWithNetwork(id ID, name, network string) NodeInfo {
+	return DefaultNodeInfo{
+		ProtocolVersion: defaultProtocolVersion,
+		DefaultNodeID:   id,
+		ListenAddr:      fmt.Sprintf("127.0.0.1:%d", getFreePort()),
+		Network:         network,
+		Version:         "1.2.3-rc0-deadbeef",
+		Channels:        []byte{testCh},
+		Moniker:         name,
+		Other: DefaultNodeInfoOther{
+			TxIndex:    "on",
+			RPCAddress: fmt.Sprintf("127.0.0.1:%d", getFreePort()),
+		},
+	}
+}
+
+func getFreePort() int {
+	port, err := tmnet.GetFreePort()
+	if err != nil {
+		panic(err)
+	}
+	return port
 }

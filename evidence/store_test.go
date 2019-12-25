@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	dbm "github.com/tendermint/tendermint/libs/db"
 	"github.com/tendermint/tendermint/types"
+	dbm "github.com/tendermint/tm-db"
 )
 
 //-------------------------------------------
@@ -14,7 +14,7 @@ func TestStoreAddDuplicate(t *testing.T) {
 	assert := assert.New(t)
 
 	db := dbm.NewMemDB()
-	store := NewEvidenceStore(db)
+	store := NewStore(db)
 
 	priority := int64(10)
 	ev := types.NewMockGoodEvidence(2, 1, []byte("val1"))
@@ -27,11 +27,26 @@ func TestStoreAddDuplicate(t *testing.T) {
 	assert.False(added)
 }
 
+func TestStoreCommitDuplicate(t *testing.T) {
+	assert := assert.New(t)
+
+	db := dbm.NewMemDB()
+	store := NewStore(db)
+
+	priority := int64(10)
+	ev := types.NewMockGoodEvidence(2, 1, []byte("val1"))
+
+	store.MarkEvidenceAsCommitted(ev)
+
+	added := store.AddNewEvidence(ev, priority)
+	assert.False(added)
+}
+
 func TestStoreMark(t *testing.T) {
 	assert := assert.New(t)
 
 	db := dbm.NewMemDB()
-	store := NewEvidenceStore(db)
+	store := NewStore(db)
 
 	// before we do anything, priority/pending are empty
 	priorityEv := store.PriorityEvidence()
@@ -46,7 +61,7 @@ func TestStoreMark(t *testing.T) {
 	assert.True(added)
 
 	// get the evidence. verify. should be uncommitted
-	ei := store.GetEvidence(ev.Height(), ev.Hash())
+	ei := store.GetInfo(ev.Height(), ev.Hash())
 	assert.Equal(ev, ei.Evidence)
 	assert.Equal(priority, ei.Priority)
 	assert.False(ei.Committed)
@@ -72,9 +87,10 @@ func TestStoreMark(t *testing.T) {
 	assert.Equal(0, len(pendingEv))
 
 	// evidence should show committed
-	ei = store.GetEvidence(ev.Height(), ev.Hash())
+	newPriority := int64(0)
+	ei = store.GetInfo(ev.Height(), ev.Hash())
 	assert.Equal(ev, ei.Evidence)
-	assert.Equal(priority, ei.Priority)
+	assert.Equal(newPriority, ei.Priority)
 	assert.True(ei.Committed)
 }
 
@@ -82,7 +98,7 @@ func TestStorePriority(t *testing.T) {
 	assert := assert.New(t)
 
 	db := dbm.NewMemDB()
-	store := NewEvidenceStore(db)
+	store := NewStore(db)
 
 	// sorted by priority and then height
 	cases := []struct {

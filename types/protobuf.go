@@ -9,6 +9,7 @@ import (
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/crypto/ed25519"
 	"github.com/tendermint/tendermint/crypto/secp256k1"
+	"github.com/tendermint/tendermint/crypto/sr25519"
 )
 
 //-------------------------------------------------------
@@ -21,8 +22,16 @@ const (
 
 const (
 	ABCIPubKeyTypeEd25519   = "ed25519"
+	ABCIPubKeyTypeSr25519   = "sr25519"
 	ABCIPubKeyTypeSecp256k1 = "secp256k1"
 )
+
+// TODO: Make non-global by allowing for registration of more pubkey types
+var ABCIPubKeyTypesToAminoNames = map[string]string{
+	ABCIPubKeyTypeEd25519:   ed25519.PubKeyAminoName,
+	ABCIPubKeyTypeSr25519:   sr25519.PubKeyAminoName,
+	ABCIPubKeyTypeSecp256k1: secp256k1.PubKeyAminoName,
+}
 
 //-------------------------------------------------------
 
@@ -34,21 +43,24 @@ type tm2pb struct{}
 
 func (tm2pb) Header(header *Header) abci.Header {
 	return abci.Header{
-		ChainID:  header.ChainID,
-		Height:   header.Height,
-		Time:     header.Time,
-		NumTxs:   header.NumTxs,
-		TotalTxs: header.TotalTxs,
+		Version: abci.Version{
+			Block: header.Version.Block.Uint64(),
+			App:   header.Version.App.Uint64(),
+		},
+		ChainID: header.ChainID,
+		Height:  header.Height,
+		Time:    header.Time,
 
 		LastBlockId: TM2PB.BlockID(header.LastBlockID),
 
 		LastCommitHash: header.LastCommitHash,
 		DataHash:       header.DataHash,
 
-		ValidatorsHash:  header.ValidatorsHash,
-		ConsensusHash:   header.ConsensusHash,
-		AppHash:         header.AppHash,
-		LastResultsHash: header.LastResultsHash,
+		ValidatorsHash:     header.ValidatorsHash,
+		NextValidatorsHash: header.NextValidatorsHash,
+		ConsensusHash:      header.ConsensusHash,
+		AppHash:            header.AppHash,
+		LastResultsHash:    header.LastResultsHash,
 
 		EvidenceHash:    header.EvidenceHash,
 		ProposerAddress: header.ProposerAddress,
@@ -93,6 +105,11 @@ func (tm2pb) PubKey(pubKey crypto.PubKey) abci.PubKey {
 			Type: ABCIPubKeyTypeEd25519,
 			Data: pk[:],
 		}
+	case sr25519.PubKeySr25519:
+		return abci.PubKey{
+			Type: ABCIPubKeyTypeSr25519,
+			Data: pk[:],
+		}
 	case secp256k1.PubKeySecp256k1:
 		return abci.PubKey{
 			Type: ABCIPubKeyTypeSecp256k1,
@@ -114,12 +131,15 @@ func (tm2pb) ValidatorUpdates(vals *ValidatorSet) []abci.ValidatorUpdate {
 
 func (tm2pb) ConsensusParams(params *ConsensusParams) *abci.ConsensusParams {
 	return &abci.ConsensusParams{
-		BlockSize: &abci.BlockSize{
-			MaxBytes: params.BlockSize.MaxBytes,
-			MaxGas:   params.BlockSize.MaxGas,
+		Block: &abci.BlockParams{
+			MaxBytes: params.Block.MaxBytes,
+			MaxGas:   params.Block.MaxGas,
 		},
-		EvidenceParams: &abci.EvidenceParams{
-			MaxAge: params.EvidenceParams.MaxAge,
+		Evidence: &abci.EvidenceParams{
+			MaxAge: params.Evidence.MaxAge,
+		},
+		Validator: &abci.ValidatorParams{
+			PubKeyTypes: params.Validator.PubKeyTypes,
 		},
 	}
 }
@@ -173,26 +193,33 @@ var PB2TM = pb2tm{}
 type pb2tm struct{}
 
 func (pb2tm) PubKey(pubKey abci.PubKey) (crypto.PubKey, error) {
-	// TODO: define these in crypto and use them
-	sizeEd := 32
-	sizeSecp := 33
 	switch pubKey.Type {
 	case ABCIPubKeyTypeEd25519:
-		if len(pubKey.Data) != sizeEd {
-			return nil, fmt.Errorf("Invalid size for PubKeyEd25519. Got %d, expected %d", len(pubKey.Data), sizeEd)
+		if len(pubKey.Data) != ed25519.PubKeyEd25519Size {
+			return nil, fmt.Errorf("invalid size for PubKeyEd25519. Got %d, expected %d",
+				len(pubKey.Data), ed25519.PubKeyEd25519Size)
 		}
 		var pk ed25519.PubKeyEd25519
 		copy(pk[:], pubKey.Data)
 		return pk, nil
+	case ABCIPubKeyTypeSr25519:
+		if len(pubKey.Data) != sr25519.PubKeySr25519Size {
+			return nil, fmt.Errorf("invalid size for PubKeySr25519. Got %d, expected %d",
+				len(pubKey.Data), sr25519.PubKeySr25519Size)
+		}
+		var pk sr25519.PubKeySr25519
+		copy(pk[:], pubKey.Data)
+		return pk, nil
 	case ABCIPubKeyTypeSecp256k1:
-		if len(pubKey.Data) != sizeSecp {
-			return nil, fmt.Errorf("Invalid size for PubKeyEd25519. Got %d, expected %d", len(pubKey.Data), sizeSecp)
+		if len(pubKey.Data) != secp256k1.PubKeySecp256k1Size {
+			return nil, fmt.Errorf("invalid size for PubKeySecp256k1. Got %d, expected %d",
+				len(pubKey.Data), secp256k1.PubKeySecp256k1Size)
 		}
 		var pk secp256k1.PubKeySecp256k1
 		copy(pk[:], pubKey.Data)
 		return pk, nil
 	default:
-		return nil, fmt.Errorf("Unknown pubkey type %v", pubKey.Type)
+		return nil, fmt.Errorf("unknown pubkey type %v", pubKey.Type)
 	}
 }
 
@@ -206,16 +233,4 @@ func (pb2tm) ValidatorUpdates(vals []abci.ValidatorUpdate) ([]*Validator, error)
 		tmVals[i] = NewValidator(pub, v.Power)
 	}
 	return tmVals, nil
-}
-
-func (pb2tm) ConsensusParams(csp *abci.ConsensusParams) ConsensusParams {
-	return ConsensusParams{
-		BlockSize: BlockSize{
-			MaxBytes: csp.BlockSize.MaxBytes,
-			MaxGas:   csp.BlockSize.MaxGas,
-		},
-		EvidenceParams: EvidenceParams{
-			MaxAge: csp.EvidenceParams.MaxAge,
-		},
-	}
 }

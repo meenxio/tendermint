@@ -47,7 +47,7 @@ func TestWSClientReconnectWithJitter(t *testing.T) {
 	for key, c := range clientMap {
 		if !c.IsActive() {
 			delete(clientMap, key)
-			stopCount += 1
+			stopCount++
 		}
 	}
 	require.Equal(t, stopCount, n, "expecting all clients to have been stopped")
@@ -58,7 +58,7 @@ func TestWSClientReconnectWithJitter(t *testing.T) {
 	seenMap := make(map[string]int)
 	for i, match := range matches {
 		if origIndex, seen := seenMap[string(match)]; seen {
-			t.Errorf("Match #%d (%q) was seen originally at log entry #%d", i, match, origIndex)
+			t.Errorf("match #%d (%q) was seen originally at log entry #%d", i, match, origIndex)
 		} else {
 			seenMap[string(match)] = i
 		}

@@ -1,18 +1,24 @@
 package evidence
 
 import (
+	"os"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
-	dbm "github.com/tendermint/tendermint/libs/db"
 	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/types"
 	tmtime "github.com/tendermint/tendermint/types/time"
+	dbm "github.com/tendermint/tm-db"
 )
 
-var mockState = sm.State{}
+func TestMain(m *testing.M) {
+	types.RegisterMockEvidences(cdc)
+
+	code := m.Run()
+	os.Exit(code)
+}
 
 func initializeValidatorState(valAddr []byte, height int64) dbm.DB {
 	stateDB := dbm.NewMemDB()
@@ -27,10 +33,10 @@ func initializeValidatorState(valAddr []byte, height int64) dbm.DB {
 		LastBlockHeight:             0,
 		LastBlockTime:               tmtime.Now(),
 		Validators:                  valSet,
-		NextValidators:              valSet.CopyIncrementAccum(1),
+		NextValidators:              valSet.CopyIncrementProposerPriority(1),
 		LastHeightValidatorsChanged: 1,
 		ConsensusParams: types.ConsensusParams{
-			EvidenceParams: types.EvidenceParams{
+			Evidence: types.EvidenceParams{
 				MaxAge: 1000000,
 			},
 		},
@@ -50,11 +56,11 @@ func TestEvidencePool(t *testing.T) {
 	valAddr := []byte("val1")
 	height := int64(5)
 	stateDB := initializeValidatorState(valAddr, height)
-	store := NewEvidenceStore(dbm.NewMemDB())
-	pool := NewEvidencePool(stateDB, store)
+	evidenceDB := dbm.NewMemDB()
+	pool := NewPool(stateDB, evidenceDB)
 
 	goodEvidence := types.NewMockGoodEvidence(height, 0, valAddr)
-	badEvidence := types.MockBadEvidence{goodEvidence}
+	badEvidence := types.MockBadEvidence{MockGoodEvidence: goodEvidence}
 
 	// bad evidence
 	err := pool.AddEvidence(badEvidence)
@@ -77,4 +83,25 @@ func TestEvidencePool(t *testing.T) {
 	err = pool.AddEvidence(goodEvidence)
 	assert.Nil(t, err)
 	assert.Equal(t, 1, pool.evidenceList.Len())
+}
+
+func TestEvidencePoolIsCommitted(t *testing.T) {
+	// Initialization:
+	valAddr := []byte("validator_address")
+	height := int64(42)
+	stateDB := initializeValidatorState(valAddr, height)
+	evidenceDB := dbm.NewMemDB()
+	pool := NewPool(stateDB, evidenceDB)
+
+	// evidence not seen yet:
+	evidence := types.NewMockGoodEvidence(height, 0, valAddr)
+	assert.False(t, pool.IsCommitted(evidence))
+
+	// evidence seen but not yet committed:
+	assert.NoError(t, pool.AddEvidence(evidence))
+	assert.False(t, pool.IsCommitted(evidence))
+
+	// evidence seen and committed:
+	pool.MarkEvidenceAsCommitted(height, []types.Evidence{evidence})
+	assert.True(t, pool.IsCommitted(evidence))
 }

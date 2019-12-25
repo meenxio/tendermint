@@ -1,3 +1,7 @@
+---
+order: 4
+---
+
 # Application Development Guide
 
 ## XXX
@@ -47,94 +51,10 @@ The mempool and consensus logic act as clients, and each maintains an
 open ABCI connection with the application, which hosts an ABCI server.
 Shown are the request and response types sent on each connection.
 
-## Message Protocol
-
-The message protocol consists of pairs of requests and responses. Some
-messages have no fields, while others may include byte-arrays, strings,
-or integers. See the `message Request` and `message Response`
-definitions in [the protobuf definition
-file](https://github.com/tendermint/tendermint/blob/develop/abci/types/types.proto),
-and the [protobuf
-documentation](https://developers.google.com/protocol-buffers/docs/overview)
-for more details.
-
-For each request, a server should respond with the corresponding
-response, where order of requests is preserved in the order of
-responses.
-
-## Server
-
-To use ABCI in your programming language of choice, there must be a ABCI
-server in that language. Tendermint supports two kinds of implementation
-of the server:
-
-- Asynchronous, raw socket server (Tendermint Socket Protocol, also
-  known as TSP or Teaspoon)
-- GRPC
-
-Both can be tested using the `abci-cli` by setting the `--abci` flag
-appropriately (ie. to `socket` or `grpc`).
-
-See examples, in various stages of maintenance, in
-[Go](https://github.com/tendermint/tendermint/tree/develop/abci/server),
-[JavaScript](https://github.com/tendermint/js-abci),
-[Python](https://github.com/tendermint/tendermint/tree/develop/abci/example/python3/abci),
-[C++](https://github.com/mdyring/cpp-tmsp), and
-[Java](https://github.com/jTendermint/jabci).
-
-### GRPC
-
-If GRPC is available in your language, this is the easiest approach,
-though it will have significant performance overhead.
-
-To get started with GRPC, copy in the [protobuf
-file](https://github.com/tendermint/tendermint/blob/develop/abci/types/types.proto)
-and compile it using the GRPC plugin for your language. For instance,
-for golang, the command is `protoc --go_out=plugins=grpc:. types.proto`.
-See the [grpc documentation for more details](http://www.grpc.io/docs/).
-`protoc` will autogenerate all the necessary code for ABCI client and
-server in your language, including whatever interface your application
-must satisfy to be used by the ABCI server for handling requests.
-
-### TSP
-
-If GRPC is not available in your language, or you require higher
-performance, or otherwise enjoy programming, you may implement your own
-ABCI server using the Tendermint Socket Protocol, known affectionately
-as Teaspoon. The first step is still to auto-generate the relevant data
-types and codec in your language using `protoc`. Messages coming over
-the socket are proto3 encoded, but additionally length-prefixed to
-facilitate use as a streaming protocol. proto3 doesn't have an
-official length-prefix standard, so we use our own. The first byte in
-the prefix represents the length of the Big Endian encoded length. The
-remaining bytes in the prefix are the Big Endian encoded length.
-
-For example, if the proto3 encoded ABCI message is 0xDEADBEEF (4
-bytes), the length-prefixed message is 0x0104DEADBEEF. If the proto3
-encoded ABCI message is 65535 bytes long, the length-prefixed message
-would be like 0x02FFFF....
-
-Note this prefixing does not apply for grpc.
-
-An ABCI server must also be able to support multiple connections, as
-Tendermint uses three connections.
-
-## Client
-
-There are currently two use-cases for an ABCI client. One is a testing
-tool, as in the `abci-cli`, which allows ABCI requests to be sent via
-command line. The other is a consensus engine, such as Tendermint Core,
-which makes requests to the application every time a new transaction is
-received or a block is committed.
-
-It is unlikely that you will need to implement a client. For details of
-our client, see
-[here](https://github.com/tendermint/tendermint/tree/develop/abci/client).
-
 Most of the examples below are from [kvstore
-application](https://github.com/tendermint/tendermint/blob/develop/abci/example/kvstore/kvstore.go),
+application](https://github.com/tendermint/tendermint/blob/master/abci/example/kvstore/kvstore.go),
 which is a part of the abci repo. [persistent_kvstore
-application](https://github.com/tendermint/tendermint/blob/develop/abci/example/kvstore/persistent_kvstore.go)
+application](https://github.com/tendermint/tendermint/blob/master/abci/example/kvstore/persistent_kvstore.go)
 is used to show `BeginBlock`, `EndBlock` and `InitChain` example
 implementations.
 
@@ -185,8 +105,8 @@ mempool state (this behaviour can be turned off with
 In go:
 
 ```
-func (app *KVStoreApplication) CheckTx(tx []byte) types.Result {
-  return types.OK
+func (app *KVStoreApplication) CheckTx(req types.RequestCheckTx) types.ResponseCheckTx {
+	return types.ResponseCheckTx{Code: code.CodeTypeOK, GasWanted: 1}
 }
 ```
 
@@ -217,8 +137,8 @@ the mempool. If Tendermint is just started or the clients sent more than
 100k transactions, old transactions may be sent to the application. So
 it is important CheckTx implements some logic to handle them.
 
-There are cases where a transaction will (or may) become valid in some
-future state, in which case you probably want to disable Tendermint's
+If there are cases in your application where a transaction may become invalid in some
+future state, you probably want to disable Tendermint's
 cache. You can do that by setting `[mempool] cache_size = 0` in the
 config.
 
@@ -252,14 +172,29 @@ In go:
 
 ```
 // tx is either "key=value" or just arbitrary bytes
-func (app *KVStoreApplication) DeliverTx(tx []byte) types.Result {
-  parts := strings.Split(string(tx), "=")
-  if len(parts) == 2 {
-    app.state.Set([]byte(parts[0]), []byte(parts[1]))
-  } else {
-    app.state.Set(tx, tx)
-  }
-  return types.OK
+func (app *KVStoreApplication) DeliverTx(req types.RequestDeliverTx) types.ResponseDeliverTx {
+	var key, value []byte
+	parts := bytes.Split(req.Tx, []byte("="))
+	if len(parts) == 2 {
+		key, value = parts[0], parts[1]
+	} else {
+		key, value = req.Tx, req.Tx
+	}
+
+	app.state.db.Set(prefixKey(key), value)
+	app.state.Size += 1
+
+	events := []types.Event{
+		{
+			Type: "app",
+			Attributes: []kv.Pair{
+				{Key: []byte("creator"), Value: []byte("Cosmoshi Netowoko")},
+				{Key: []byte("key"), Value: key},
+			},
+		},
+	}
+
+	return types.ResponseDeliverTx{Code: code.CodeTypeOK, Events: events}
 }
 ```
 
@@ -289,7 +224,7 @@ Once all processing of the block is complete, Tendermint sends the
 Commit request and blocks waiting for a response. While the mempool may
 run concurrently with block processing (the BeginBlock, DeliverTxs, and
 EndBlock), it is locked for the Commit request so that its state can be
-safely reset during Commit. This means the app _MUST NOT_ do any
+safely updated during Commit. This means the app _MUST NOT_ do any
 blocking communication with the mempool (ie. broadcast_tx) during
 Commit, or there will be deadlock. Note also that all remaining
 transactions in the mempool are replayed on the mempool connection
@@ -307,9 +242,14 @@ job of the [Handshake](#handshake).
 In go:
 
 ```
-func (app *KVStoreApplication) Commit() types.Result {
-  hash := app.state.Hash()
-  return types.NewResultOK(hash, "")
+func (app *KVStoreApplication) Commit() types.ResponseCommit {
+	// Using a memdb - just return the big endian size of the db
+	appHash := make([]byte, 8)
+	binary.PutVarint(appHash, app.state.Size)
+	app.state.AppHash = appHash
+	app.state.Height += 1
+	saveState(app.state)
+	return types.ResponseCommit{Data: appHash}
 }
 ```
 
@@ -340,12 +280,10 @@ In go:
 
 ```
 // Track the block hash and header information
-func (app *PersistentKVStoreApplication) BeginBlock(params types.RequestBeginBlock) {
-  // update latest block info
-  app.blockHeader = params.Header
-
-  // reset valset changes
-  app.changes = make([]*types.Validator, 0)
+func (app *PersistentKVStoreApplication) BeginBlock(req types.RequestBeginBlock) types.ResponseBeginBlock {
+	// reset valset changes
+	app.ValUpdates = make([]types.ValidatorUpdate, 0)
+	return types.ResponseBeginBlock{}
 }
 ```
 
@@ -360,7 +298,6 @@ ResponseBeginBlock requestBeginBlock(RequestBeginBlock req) {
     Header header = req.getHeader();
     byte[] prevAppHash = header.getAppHash().toByteArray();
     long prevHeight = header.getHeight();
-    long numTxs = header.getNumTxs();
 
     // run your pre-block logic. Maybe prepare a state snapshot, message components, etc
 
@@ -387,7 +324,7 @@ In go:
 ```
 // Update the validator set
 func (app *PersistentKVStoreApplication) EndBlock(req types.RequestEndBlock) types.ResponseEndBlock {
-  return types.ResponseEndBlock{ValidatorUpdates: app.ValUpdates}
+	return types.ResponseEndBlock{ValidatorUpdates: app.ValUpdates}
 }
 ```
 
@@ -432,51 +369,53 @@ In go:
 
 ```
 func (app *KVStoreApplication) Query(reqQuery types.RequestQuery) (resQuery types.ResponseQuery) {
-  if reqQuery.Prove {
-    value, proof, exists := app.state.Proof(reqQuery.Data)
-    resQuery.Index = -1 // TODO make Proof return index
-    resQuery.Key = reqQuery.Data
-    resQuery.Value = value
-    resQuery.Proof = proof
-    if exists {
-      resQuery.Log = "exists"
-    } else {
-      resQuery.Log = "does not exist"
-    }
-    return
-  } else {
-    index, value, exists := app.state.Get(reqQuery.Data)
-    resQuery.Index = int64(index)
-    resQuery.Value = value
-    if exists {
-      resQuery.Log = "exists"
-    } else {
-      resQuery.Log = "does not exist"
-    }
-    return
-  }
+	if reqQuery.Prove {
+		value := app.state.db.Get(prefixKey(reqQuery.Data))
+		resQuery.Index = -1 // TODO make Proof return index
+		resQuery.Key = reqQuery.Data
+		resQuery.Value = value
+		if value != nil {
+			resQuery.Log = "exists"
+		} else {
+			resQuery.Log = "does not exist"
+		}
+		return
+	} else {
+		resQuery.Key = reqQuery.Data
+		value := app.state.db.Get(prefixKey(reqQuery.Data))
+		resQuery.Value = value
+		if value != nil {
+			resQuery.Log = "exists"
+		} else {
+			resQuery.Log = "does not exist"
+		}
+		return
+	}
 }
 ```
 
 In Java:
 
 ```
-ResponseQuery requestQuery(RequestQuery req) {
-    final boolean isProveQuery = req.getProve();
-    final ResponseQuery.Builder responseBuilder = ResponseQuery.newBuilder();
+    ResponseQuery requestQuery(RequestQuery req) {
+        final boolean isProveQuery = req.getProve();
+        final ResponseQuery.Builder responseBuilder = ResponseQuery.newBuilder();
+		byte[] queryData = req.getData().toByteArray();
 
-    if (isProveQuery) {
-        com.app.example.ProofResult proofResult = generateProof(req.getData().toByteArray());
-        final byte[] proofAsByteArray = proofResult.getAsByteArray();
-
-        responseBuilder.setProof(ByteString.copyFrom(proofAsByteArray));
-        responseBuilder.setKey(req.getData());
-        responseBuilder.setValue(ByteString.copyFrom(proofResult.getData()));
-        responseBuilder.setLog(result.getLogValue());
-    } else {
-        byte[] queryData = req.getData().toByteArray();
-
-        final com.app.example.QueryResult result = generateQueryResult(queryData);
+        if (isProveQuery) {
+            com.app.example.QueryResultWithProof result = generateQueryResultWithProof(queryData);
+            responseBuilder.setIndex(result.getLeftIndex());
+            responseBuilder.setKey(req.getData());
+            responseBuilder.setValue(result.getValueOrNull(0));
+            responseBuilder.setHeight(result.getHeight());
+            responseBuilder.setProof(result.getProof());
+            responseBuilder.setLog(result.getLogValue());
+        } else {
+            com.app.example.QueryResult result = generateQueryResult(queryData);
+            responseBuilder.setIndex(result.getIndex());
+            responseBuilder.setValue(result.getValue());
+            responseBuilder.setLog(result.getLogValue());
+        }
 
         responseBuilder.setIndex(result.getIndex());
         responseBuilder.setValue(ByteString.copyFrom(result.getValue()));
@@ -507,7 +446,11 @@ In go:
 
 ```
 func (app *KVStoreApplication) Info(req types.RequestInfo) (resInfo types.ResponseInfo) {
-  return types.ResponseInfo{Data: fmt.Sprintf("{\"size\":%v}", app.state.Size())}
+	return types.ResponseInfo{
+		Data:       fmt.Sprintf("{\"size\":%v}", app.state.Size),
+		Version:    version.ABCIVersion,
+		AppVersion: ProtocolVersion.Uint64(),
+	}
 }
 ```
 
@@ -531,13 +474,14 @@ In go:
 
 ```
 // Save the validators in the merkle tree
-func (app *PersistentKVStoreApplication) InitChain(params types.RequestInitChain) {
-  for _, v := range params.Validators {
-    r := app.updateValidator(v)
-    if r.IsErr() {
-      app.logger.Error("Error updating validators", "r", r)
-    }
-  }
+func (app *PersistentKVStoreApplication) InitChain(req types.RequestInitChain) types.ResponseInitChain {
+	for _, v := range req.Validators {
+		r := app.updateValidator(v)
+		if r.IsErr() {
+			app.logger.Error("Error updating validators", "r", r)
+		}
+	}
+	return types.ResponseInitChain{}
 }
 ```
 

@@ -11,11 +11,11 @@ import (
 type knownAddress struct {
 	Addr        *p2p.NetAddress `json:"addr"`
 	Src         *p2p.NetAddress `json:"src"`
+	Buckets     []int           `json:"buckets"`
 	Attempts    int32           `json:"attempts"`
+	BucketType  byte            `json:"bucket_type"`
 	LastAttempt time.Time       `json:"last_attempt"`
 	LastSuccess time.Time       `json:"last_success"`
-	BucketType  byte            `json:"bucket_type"`
-	Buckets     []int           `json:"buckets"`
 }
 
 func newKnownAddress(addr *p2p.NetAddress, src *p2p.NetAddress) *knownAddress {
@@ -31,18 +31,6 @@ func newKnownAddress(addr *p2p.NetAddress, src *p2p.NetAddress) *knownAddress {
 
 func (ka *knownAddress) ID() p2p.ID {
 	return ka.Addr.ID
-}
-
-func (ka *knownAddress) copy() *knownAddress {
-	return &knownAddress{
-		Addr:        ka.Addr,
-		Src:         ka.Src,
-		Attempts:    ka.Attempts,
-		LastAttempt: ka.LastAttempt,
-		LastSuccess: ka.LastSuccess,
-		BucketType:  ka.BucketType,
-		Buckets:     ka.Buckets,
-	}
 }
 
 func (ka *knownAddress) isOld() bool {

@@ -8,12 +8,36 @@ import (
 
 	"github.com/tendermint/tendermint/types"
 	tmtime "github.com/tendermint/tendermint/types/time"
+	"github.com/tendermint/tendermint/version"
 )
 
 // database keys
 var (
 	stateKey = []byte("stateKey")
 )
+
+//-----------------------------------------------------------------------------
+
+// Version is for versioning the State.
+// It holds the Block and App version needed for making blocks,
+// and the software version to support upgrades to the format of
+// the State as stored on disk.
+type Version struct {
+	Consensus version.Consensus
+	Software  string
+}
+
+// initStateVersion sets the Consensus.Block and Software versions,
+// but leaves the Consensus.App version blank.
+// The Consensus.App version will be set during the Handshake, once
+// we hear from the app what protocol version it is running.
+var initStateVersion = Version{
+	Consensus: version.Consensus{
+		Block: version.BlockProtocol,
+		App:   0,
+	},
+	Software: version.TMCoreSemVer,
+}
 
 //-----------------------------------------------------------------------------
 
@@ -25,20 +49,22 @@ var (
 // Instead, use state.Copy() or state.NextState(...).
 // NOTE: not goroutine-safe.
 type State struct {
+	Version Version
+
 	// immutable
 	ChainID string
 
 	// LastBlockHeight=0 at genesis (ie. block(H=0) does not exist)
-	LastBlockHeight  int64
-	LastBlockTotalTx int64
-	LastBlockID      types.BlockID
-	LastBlockTime    time.Time
+	LastBlockHeight int64
+	LastBlockID     types.BlockID
+	LastBlockTime   time.Time
 
 	// LastValidators is used to validate block.LastCommit.
 	// Validators are persisted to the database separately every time they change,
 	// so we can query for historical validator sets.
 	// Note that if s.LastBlockHeight causes a valset change,
-	// we set s.LastHeightValidatorsChanged = s.LastBlockHeight + 1
+	// we set s.LastHeightValidatorsChanged = s.LastBlockHeight + 1 + 1
+	// Extra +1 due to nextValSet delay.
 	NextValidators              *types.ValidatorSet
 	Validators                  *types.ValidatorSet
 	LastValidators              *types.ValidatorSet
@@ -59,12 +85,12 @@ type State struct {
 // Copy makes a copy of the State for mutating.
 func (state State) Copy() State {
 	return State{
+		Version: state.Version,
 		ChainID: state.ChainID,
 
-		LastBlockHeight:  state.LastBlockHeight,
-		LastBlockTotalTx: state.LastBlockTotalTx,
-		LastBlockID:      state.LastBlockID,
-		LastBlockTime:    state.LastBlockTime,
+		LastBlockHeight: state.LastBlockHeight,
+		LastBlockID:     state.LastBlockID,
+		LastBlockTime:   state.LastBlockTime,
 
 		NextValidators:              state.NextValidators.Copy(),
 		Validators:                  state.Validators.Copy(),
@@ -101,7 +127,7 @@ func (state State) IsEmpty() bool {
 
 // MakeBlock builds a block from the current state with the given txs, commit,
 // and evidence. Note it also takes a proposerAddress because the state does not
-// track rounds, and hence doesn't know the correct proposer. TODO: alleviate this!
+// track rounds, and hence does not know the correct proposer. TODO: fix this!
 func (state State) MakeBlock(
 	height int64,
 	txs []types.Tx,
@@ -113,31 +139,22 @@ func (state State) MakeBlock(
 	// Build base block with block data.
 	block := types.MakeBlock(height, txs, commit, evidence)
 
-	// Fill rest of header with state data.
-	block.ChainID = state.ChainID
-
-	// Set time
+	// Set time.
+	var timestamp time.Time
 	if height == 1 {
-		block.Time = tmtime.Now()
-		if block.Time.Before(state.LastBlockTime) {
-			block.Time = state.LastBlockTime // state.LastBlockTime for height == 1 is genesis time
-		}
+		timestamp = state.LastBlockTime // genesis time
 	} else {
-		block.Time = MedianTime(commit, state.LastValidators)
+		timestamp = MedianTime(commit, state.LastValidators)
 	}
 
-	block.LastBlockID = state.LastBlockID
-	block.TotalTxs = state.LastBlockTotalTx + block.NumTxs
-
-	block.ValidatorsHash = state.Validators.Hash()
-	block.NextValidatorsHash = state.NextValidators.Hash()
-	block.ConsensusHash = state.ConsensusParams.Hash()
-	block.AppHash = state.AppHash
-	block.LastResultsHash = state.LastResultsHash
-
-	// NOTE: we can't use the state.Validators because we don't
-	// IncrementAccum for rounds there.
-	block.ProposerAddress = proposerAddress
+	// Fill rest of header with state data.
+	block.Header.Populate(
+		state.Version.Consensus, state.ChainID,
+		timestamp, state.LastBlockID,
+		state.Validators.Hash(), state.NextValidators.Hash(),
+		state.ConsensusParams.Hash(), state.AppHash, state.LastResultsHash,
+		proposerAddress,
+	)
 
 	return block, block.MakePartSet(types.BlockPartSizeBytes)
 }
@@ -147,15 +164,18 @@ func (state State) MakeBlock(
 // the votes sent by honest processes, i.e., a faulty processes can not arbitrarily increase or decrease the
 // computed value.
 func MedianTime(commit *types.Commit, validators *types.ValidatorSet) time.Time {
-
-	weightedTimes := make([]*tmtime.WeightedTime, len(commit.Precommits))
+	weightedTimes := make([]*tmtime.WeightedTime, len(commit.Signatures))
 	totalVotingPower := int64(0)
 
-	for i, vote := range commit.Precommits {
-		if vote != nil {
-			_, validator := validators.GetByIndex(vote.ValidatorIndex)
+	for i, commitSig := range commit.Signatures {
+		if commitSig.Absent() {
+			continue
+		}
+		_, validator := validators.GetByAddress(commitSig.ValidatorAddress)
+		// If there's no condition, TestValidateBlockCommit panics; not needed normally.
+		if validator != nil {
 			totalVotingPower += validator.VotingPower
-			weightedTimes[i] = tmtime.NewWeightedTime(vote.Timestamp, validator.VotingPower)
+			weightedTimes[i] = tmtime.NewWeightedTime(commitSig.Timestamp, validator.VotingPower)
 		}
 	}
 
@@ -181,11 +201,11 @@ func MakeGenesisStateFromFile(genDocFile string) (State, error) {
 func MakeGenesisDocFromFile(genDocFile string) (*types.GenesisDoc, error) {
 	genDocJSON, err := ioutil.ReadFile(genDocFile)
 	if err != nil {
-		return nil, fmt.Errorf("Couldn't read GenesisDoc file: %v", err)
+		return nil, fmt.Errorf("couldn't read GenesisDoc file: %v", err)
 	}
 	genDoc, err := types.GenesisDocFromJSON(genDocJSON)
 	if err != nil {
-		return nil, fmt.Errorf("Error reading GenesisDoc: %v", err)
+		return nil, fmt.Errorf("error reading GenesisDoc: %v", err)
 	}
 	return genDoc, nil
 }
@@ -194,33 +214,32 @@ func MakeGenesisDocFromFile(genDocFile string) (*types.GenesisDoc, error) {
 func MakeGenesisState(genDoc *types.GenesisDoc) (State, error) {
 	err := genDoc.ValidateAndComplete()
 	if err != nil {
-		return State{}, fmt.Errorf("Error in genesis file: %v", err)
+		return State{}, fmt.Errorf("error in genesis file: %v", err)
 	}
 
-	// Make validators slice
-	validators := make([]*types.Validator, len(genDoc.Validators))
-	for i, val := range genDoc.Validators {
-		pubKey := val.PubKey
-		address := pubKey.Address()
-
-		// Make validator
-		validators[i] = &types.Validator{
-			Address:     address,
-			PubKey:      pubKey,
-			VotingPower: val.Power,
+	var validatorSet, nextValidatorSet *types.ValidatorSet
+	if genDoc.Validators == nil {
+		validatorSet = types.NewValidatorSet(nil)
+		nextValidatorSet = types.NewValidatorSet(nil)
+	} else {
+		validators := make([]*types.Validator, len(genDoc.Validators))
+		for i, val := range genDoc.Validators {
+			validators[i] = types.NewValidator(val.PubKey, val.Power)
 		}
+		validatorSet = types.NewValidatorSet(validators)
+		nextValidatorSet = types.NewValidatorSet(validators).CopyIncrementProposerPriority(1)
 	}
 
 	return State{
-
+		Version: initStateVersion,
 		ChainID: genDoc.ChainID,
 
 		LastBlockHeight: 0,
 		LastBlockID:     types.BlockID{},
 		LastBlockTime:   genDoc.GenesisTime,
 
-		NextValidators:              types.NewValidatorSet(validators).CopyIncrementAccum(1),
-		Validators:                  types.NewValidatorSet(validators),
+		NextValidators:              nextValidatorSet,
+		Validators:                  validatorSet,
 		LastValidators:              types.NewValidatorSet(nil),
 		LastHeightValidatorsChanged: 1,
 

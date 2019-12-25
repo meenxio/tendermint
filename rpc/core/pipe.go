@@ -1,11 +1,12 @@
 package core
 
 import (
+	"fmt"
 	"time"
 
+	cfg "github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/consensus"
-	crypto "github.com/tendermint/tendermint/crypto"
-	dbm "github.com/tendermint/tendermint/libs/db"
+	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/libs/log"
 	mempl "github.com/tendermint/tendermint/mempool"
 	"github.com/tendermint/tendermint/p2p"
@@ -13,15 +14,18 @@ import (
 	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/state/txindex"
 	"github.com/tendermint/tendermint/types"
+	dbm "github.com/tendermint/tm-db"
 )
 
 const (
 	// see README
 	defaultPerPage = 30
 	maxPerPage     = 100
-)
 
-var subscribeTimeout = 5 * time.Second
+	// SubscribeTimeout is the maximum time we wait to subscribe for an event.
+	// must be less than the server's write timeout (see rpcserver.DefaultConfig)
+	SubscribeTimeout = 5 * time.Second
+)
 
 //----------------------------------------------
 // These interfaces are used by RPC and must be thread safe
@@ -41,8 +45,8 @@ type transport interface {
 }
 
 type peers interface {
-	DialPeersAsync(p2p.AddrBook, []string, bool) error
-	NumPeers() (outbound, inbound, dialig int)
+	AddPersistentPeers([]string) error
+	DialPeersAsync([]string) error
 	Peers() p2p.IPeerSet
 }
 
@@ -65,13 +69,14 @@ var (
 	// objects
 	pubKey           crypto.PubKey
 	genDoc           *types.GenesisDoc // cache the genesis structure
-	addrBook         p2p.AddrBook
 	txIndexer        txindex.TxIndexer
-	consensusReactor *consensus.ConsensusReactor
+	consensusReactor *consensus.Reactor
 	eventBus         *types.EventBus // thread safe
-	mempool          *mempl.Mempool
+	mempool          mempl.Mempool
 
 	logger log.Logger
+
+	config cfg.RPCConfig
 )
 
 func SetStateDB(db dbm.DB) {
@@ -82,7 +87,7 @@ func SetBlockStore(bs sm.BlockStore) {
 	blockStore = bs
 }
 
-func SetMempool(mem *mempl.Mempool) {
+func SetMempool(mem mempl.Mempool) {
 	mempool = mem
 }
 
@@ -110,10 +115,6 @@ func SetGenesisDoc(doc *types.GenesisDoc) {
 	genDoc = doc
 }
 
-func SetAddrBook(book p2p.AddrBook) {
-	addrBook = book
-}
-
 func SetProxyAppQuery(appConn proxy.AppConnQuery) {
 	proxyAppQuery = appConn
 }
@@ -122,7 +123,7 @@ func SetTxIndexer(indexer txindex.TxIndexer) {
 	txIndexer = indexer
 }
 
-func SetConsensusReactor(conR *consensus.ConsensusReactor) {
+func SetConsensusReactor(conR *consensus.Reactor) {
 	consensusReactor = conR
 }
 
@@ -134,24 +135,45 @@ func SetEventBus(b *types.EventBus) {
 	eventBus = b
 }
 
-func validatePage(page, perPage, totalCount int) int {
+// SetConfig sets an RPCConfig.
+func SetConfig(c cfg.RPCConfig) {
+	config = c
+}
+
+func validatePage(page, perPage, totalCount int) (int, error) {
 	if perPage < 1 {
-		return 1
+		panic(fmt.Sprintf("zero or negative perPage: %d", perPage))
+	}
+
+	if page == 0 {
+		return 1, nil // default
 	}
 
 	pages := ((totalCount - 1) / perPage) + 1
-	if page < 1 {
-		page = 1
-	} else if page > pages {
-		page = pages
+	if pages == 0 {
+		pages = 1 // one page (even if it's empty)
+	}
+	if page < 0 || page > pages {
+		return 1, fmt.Errorf("page should be within [0, %d] range, given %d", pages, page)
 	}
 
-	return page
+	return page, nil
 }
 
 func validatePerPage(perPage int) int {
-	if perPage < 1 || perPage > maxPerPage {
+	if perPage < 1 {
 		return defaultPerPage
+	} else if perPage > maxPerPage {
+		return maxPerPage
 	}
 	return perPage
+}
+
+func validateSkipCount(page, perPage int) int {
+	skipCount := (page - 1) * perPage
+	if skipCount < 0 {
+		return 0
+	}
+
+	return skipCount
 }

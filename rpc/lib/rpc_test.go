@@ -17,8 +17,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	amino "github.com/tendermint/go-amino"
-	cmn "github.com/tendermint/tendermint/libs/common"
+	tmbytes "github.com/tendermint/tendermint/libs/bytes"
 	"github.com/tendermint/tendermint/libs/log"
+	tmrand "github.com/tendermint/tendermint/libs/rand"
 
 	client "github.com/tendermint/tendermint/rpc/lib/client"
 	server "github.com/tendermint/tendermint/rpc/lib/server"
@@ -33,6 +34,8 @@ const (
 	unixAddr   = "unix://" + unixSocket
 
 	websocketEndpoint = "/websocket/endpoint"
+
+	testVal = "acbd"
 )
 
 type ResultEcho struct {
@@ -48,7 +51,7 @@ type ResultEchoBytes struct {
 }
 
 type ResultEchoDataBytes struct {
-	Value cmn.HexBytes `json:"value"`
+	Value tmbytes.HexBytes `json:"value"`
 }
 
 // Define some routes
@@ -63,23 +66,23 @@ var Routes = map[string]*server.RPCFunc{
 // Amino codec required to encode/decode everything above.
 var RoutesCdc = amino.NewCodec()
 
-func EchoResult(v string) (*ResultEcho, error) {
+func EchoResult(ctx *types.Context, v string) (*ResultEcho, error) {
 	return &ResultEcho{v}, nil
 }
 
-func EchoWSResult(wsCtx types.WSRPCContext, v string) (*ResultEcho, error) {
+func EchoWSResult(ctx *types.Context, v string) (*ResultEcho, error) {
 	return &ResultEcho{v}, nil
 }
 
-func EchoIntResult(v int) (*ResultEchoInt, error) {
+func EchoIntResult(ctx *types.Context, v int) (*ResultEchoInt, error) {
 	return &ResultEchoInt{v}, nil
 }
 
-func EchoBytesResult(v []byte) (*ResultEchoBytes, error) {
+func EchoBytesResult(ctx *types.Context, v []byte) (*ResultEchoBytes, error) {
 	return &ResultEchoBytes{v}, nil
 }
 
-func EchoDataBytesResult(v cmn.HexBytes) (*ResultEchoDataBytes, error) {
+func EchoDataBytesResult(ctx *types.Context, v tmbytes.HexBytes) (*ResultEchoDataBytes, error) {
 	return &ResultEchoDataBytes{v}, nil
 }
 
@@ -121,12 +124,12 @@ func setup() {
 	wm := server.NewWebsocketManager(Routes, RoutesCdc, server.ReadWait(5*time.Second), server.PingPeriod(1*time.Second))
 	wm.SetLogger(tcpLogger)
 	mux.HandleFunc(websocketEndpoint, wm.WebsocketHandler)
-	go func() {
-		_, err := server.StartHTTPServer(tcpAddr, mux, tcpLogger, server.Config{})
-		if err != nil {
-			panic(err)
-		}
-	}()
+	config := server.DefaultConfig()
+	listener1, err := server.Listen(tcpAddr, config)
+	if err != nil {
+		panic(err)
+	}
+	go server.StartHTTPServer(listener1, mux, tcpLogger, config)
 
 	unixLogger := logger.With("socket", "unix")
 	mux2 := http.NewServeMux()
@@ -134,18 +137,17 @@ func setup() {
 	wm = server.NewWebsocketManager(Routes, RoutesCdc)
 	wm.SetLogger(unixLogger)
 	mux2.HandleFunc(websocketEndpoint, wm.WebsocketHandler)
-	go func() {
-		_, err := server.StartHTTPServer(unixAddr, mux2, unixLogger, server.Config{})
-		if err != nil {
-			panic(err)
-		}
-	}()
+	listener2, err := server.Listen(unixAddr, config)
+	if err != nil {
+		panic(err)
+	}
+	go server.StartHTTPServer(listener2, mux2, unixLogger, config)
 
 	// wait for servers to start
 	time.Sleep(time.Second * 2)
 }
 
-func echoViaHTTP(cl client.HTTPClient, val string) (string, error) {
+func echoViaHTTP(cl client.JSONRPCCaller, val string) (string, error) {
 	params := map[string]interface{}{
 		"arg": val,
 	}
@@ -156,7 +158,7 @@ func echoViaHTTP(cl client.HTTPClient, val string) (string, error) {
 	return result.Value, nil
 }
 
-func echoIntViaHTTP(cl client.HTTPClient, val int) (int, error) {
+func echoIntViaHTTP(cl client.JSONRPCCaller, val int) (int, error) {
 	params := map[string]interface{}{
 		"arg": val,
 	}
@@ -167,7 +169,7 @@ func echoIntViaHTTP(cl client.HTTPClient, val int) (int, error) {
 	return result.Value, nil
 }
 
-func echoBytesViaHTTP(cl client.HTTPClient, bytes []byte) ([]byte, error) {
+func echoBytesViaHTTP(cl client.JSONRPCCaller, bytes []byte) ([]byte, error) {
 	params := map[string]interface{}{
 		"arg": bytes,
 	}
@@ -178,7 +180,7 @@ func echoBytesViaHTTP(cl client.HTTPClient, bytes []byte) ([]byte, error) {
 	return result.Value, nil
 }
 
-func echoDataBytesViaHTTP(cl client.HTTPClient, bytes cmn.HexBytes) (cmn.HexBytes, error) {
+func echoDataBytesViaHTTP(cl client.JSONRPCCaller, bytes tmbytes.HexBytes) (tmbytes.HexBytes, error) {
 	params := map[string]interface{}{
 		"arg": bytes,
 	}
@@ -190,7 +192,7 @@ func echoDataBytesViaHTTP(cl client.HTTPClient, bytes cmn.HexBytes) (cmn.HexByte
 }
 
 func testWithHTTPClient(t *testing.T, cl client.HTTPClient) {
-	val := "acbd"
+	val := testVal
 	got, err := echoViaHTTP(cl, val)
 	require.Nil(t, err)
 	assert.Equal(t, got, val)
@@ -200,12 +202,12 @@ func testWithHTTPClient(t *testing.T, cl client.HTTPClient) {
 	require.Nil(t, err)
 	assert.Equal(t, got2, val2)
 
-	val3 := cmn.HexBytes(randBytes(t))
+	val3 := tmbytes.HexBytes(randBytes(t))
 	got3, err := echoDataBytesViaHTTP(cl, val3)
 	require.Nil(t, err)
 	assert.Equal(t, got3, val3)
 
-	val4 := cmn.RandIntn(10000)
+	val4 := tmrand.Intn(10000)
 	got4, err := echoIntViaHTTP(cl, val4)
 	require.Nil(t, err)
 	assert.Equal(t, got4, val4)
@@ -256,7 +258,7 @@ func echoBytesViaWS(cl *client.WSClient, bytes []byte) ([]byte, error) {
 }
 
 func testWithWSClient(t *testing.T, cl *client.WSClient) {
-	val := "acbd"
+	val := testVal
 	got, err := echoViaWS(cl, val)
 	require.Nil(t, err)
 	assert.Equal(t, got, val)
@@ -315,7 +317,7 @@ func TestWSNewWSRPCFunc(t *testing.T) {
 	require.Nil(t, err)
 	defer cl.Stop()
 
-	val := "acbd"
+	val := testVal
 	params := map[string]interface{}{
 		"arg": val,
 	}
@@ -340,7 +342,7 @@ func TestWSHandlesArrayParams(t *testing.T) {
 	require.Nil(t, err)
 	defer cl.Stop()
 
-	val := "acbd"
+	val := testVal
 	params := []interface{}{val}
 	err = cl.CallWithArrayParams(context.Background(), "echo_ws", params)
 	require.Nil(t, err)
@@ -369,7 +371,7 @@ func TestWSClientPingPong(t *testing.T) {
 }
 
 func randBytes(t *testing.T) []byte {
-	n := cmn.RandIntn(10) + 2
+	n := tmrand.Intn(10) + 2
 	buf := make([]byte, n)
 	_, err := crand.Read(buf)
 	require.Nil(t, err)

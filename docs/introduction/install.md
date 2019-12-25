@@ -1,11 +1,8 @@
-# Install Tendermint
+---
+order: 3
+---
 
-The fastest and easiest way to install the `tendermint` binary
-is to run [this script](https://github.com/tendermint/tendermint/blob/develop/scripts/install/install_tendermint_ubuntu.sh) on
-a fresh Ubuntu instance,
-or [this script](https://github.com/tendermint/tendermint/blob/develop/scripts/install/install_tendermint_bsd.sh)
-on a fresh FreeBSD instance. Read the comments / instructions carefully (i.e., reset your terminal after running the script,
-make sure you are okay with the network connections being made).
+# Install Tendermint
 
 ## From Binary
 
@@ -14,7 +11,13 @@ To download pre-built binaries, see the [releases page](https://github.com/tende
 ## From Source
 
 You'll need `go` [installed](https://golang.org/doc/install) and the required
-[environment variables set](https://github.com/tendermint/tendermint/wiki/Setting-GOPATH)
+environment variables set, which can be done with the following commands:
+
+```bash
+echo export GOPATH=\"\$HOME/go\" >> ~/.bash_profile
+echo export PATH=\"\$PATH:\$GOPATH/bin\" >> ~/.bash_profile
+echo export GO111MODULE=on >> ~/.bash_profile
+```
 
 ### Get Source Code
 
@@ -28,8 +31,7 @@ cd tendermint
 ### Get Tools & Dependencies
 
 ```
-make get_tools
-make get_vendor_deps
+make tools
 ```
 
 ### Compile
@@ -46,7 +48,17 @@ make build
 
 to put the binary in `./build`.
 
-The latest `tendermint version` is now installed.
+_DISCLAIMER_ The binary of tendermint is build/installed without the DWARF
+symbol table. If you would like to build/install tendermint with the DWARF
+symbol and debug information, remove `-s -w` from `BUILD_FLAGS` in the make
+file.
+
+The latest tendermint is now installed. You can verify the installation by
+running:
+
+```
+tendermint version
+```
 
 ## Run
 
@@ -71,7 +83,6 @@ To upgrade, run
 ```
 cd $GOPATH/src/github.com/tendermint/tendermint
 git pull origin master
-make get_vendor_deps
 make install
 ```
 
@@ -79,11 +90,7 @@ make install
 
 Install [LevelDB](https://github.com/google/leveldb) (minimum version is 1.7).
 
-Build Tendermint with C libraries: `make build_c`.
-
-### Ubuntu
-
-Install LevelDB with snappy:
+Install LevelDB with snappy (optionally). Below are commands for Ubuntu:
 
 ```
 sudo apt-get update
@@ -95,22 +102,30 @@ wget https://github.com/google/leveldb/archive/v1.20.tar.gz && \
   tar -zxvf v1.20.tar.gz && \
   cd leveldb-1.20/ && \
   make && \
-  cp -r out-static/lib* out-shared/lib* /usr/local/lib/ && \
+  sudo cp -r out-static/lib* out-shared/lib* /usr/local/lib/ && \
   cd include/ && \
-  cp -r leveldb /usr/local/include/ && \
+  sudo cp -r leveldb /usr/local/include/ && \
   sudo ldconfig && \
   rm -f v1.20.tar.gz
 ```
 
-Set database backend to cleveldb:
+Set a database backend to `cleveldb`:
 
 ```
 # config/config.toml
 db_backend = "cleveldb"
 ```
 
-To build Tendermint, run
+To install Tendermint, run:
 
 ```
-CGO_LDFLAGS="-lsnappy" go build -ldflags "-X github.com/tendermint/tendermint/version.GitCommit=`git rev-parse --short=8 HEAD`" -tags "tendermint gcc" -o build/tendermint ./cmd/tendermint/
+CGO_LDFLAGS="-lsnappy" make install_c
 ```
+
+or run:
+
+```
+CGO_LDFLAGS="-lsnappy" make build_c
+```
+
+which puts the binary in `./build`.
