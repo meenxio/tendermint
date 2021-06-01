@@ -1,18 +1,21 @@
 package privval
 
 import (
+	"context"
 	"io"
-	"sync"
 
+	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
 	"github.com/tendermint/tendermint/libs/service"
+	privvalproto "github.com/tendermint/tendermint/proto/tendermint/privval"
 	"github.com/tendermint/tendermint/types"
 )
 
 // ValidationRequestHandlerFunc handles different remoteSigner requests
 type ValidationRequestHandlerFunc func(
+	ctx context.Context,
 	privVal types.PrivValidator,
-	requestMessage SignerMessage,
-	chainID string) (SignerMessage, error)
+	requestMessage privvalproto.Message,
+	chainID string) (privvalproto.Message, error)
 
 type SignerServer struct {
 	service.BaseService
@@ -21,7 +24,7 @@ type SignerServer struct {
 	chainID  string
 	privVal  types.PrivValidator
 
-	handlerMtx               sync.Mutex
+	handlerMtx               tmsync.Mutex
 	validationRequestHandler ValidationRequestHandlerFunc
 }
 
@@ -70,23 +73,21 @@ func (ss *SignerServer) servicePendingRequest() {
 		return
 	}
 
-	var res SignerMessage
+	var res privvalproto.Message
 	{
 		// limit the scope of the lock
 		ss.handlerMtx.Lock()
 		defer ss.handlerMtx.Unlock()
-		res, err = ss.validationRequestHandler(ss.privVal, req, ss.chainID)
+		res, err = ss.validationRequestHandler(context.TODO(), ss.privVal, req, ss.chainID) // todo
 		if err != nil {
 			// only log the error; we'll reply with an error in res
 			ss.Logger.Error("SignerServer: handleMessage", "err", err)
 		}
 	}
 
-	if res != nil {
-		err = ss.endpoint.WriteMessage(res)
-		if err != nil {
-			ss.Logger.Error("SignerServer: writeMessage", "err", err)
-		}
+	err = ss.endpoint.WriteMessage(res)
+	if err != nil {
+		ss.Logger.Error("SignerServer: writeMessage", "err", err)
 	}
 }
 

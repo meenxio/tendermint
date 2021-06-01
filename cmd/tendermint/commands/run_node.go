@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	cfg "github.com/tendermint/tendermint/config"
@@ -23,102 +22,112 @@ var (
 // These are exposed for convenience of commands embedding a tendermint node
 func AddNodeFlags(cmd *cobra.Command) {
 	// bind flags
-	cmd.Flags().String("moniker", config.Moniker, "Node Name")
+	cmd.Flags().String("moniker", config.Moniker, "node name")
+
+	// mode flags
+	cmd.Flags().String("mode", config.Mode, "node mode (full | validator | seed)")
 
 	// priv val flags
 	cmd.Flags().String(
-		"priv_validator_laddr",
-		config.PrivValidatorListenAddr,
-		"Socket address to listen on for connections from external priv_validator process")
+		"priv-validator-laddr",
+		config.PrivValidator.ListenAddr,
+		"socket address to listen on for connections from external priv-validator process")
 
 	// node flags
-	cmd.Flags().Bool("fast_sync", config.FastSyncMode, "Fast blockchain syncing")
+	cmd.Flags().Bool("fast-sync", config.FastSyncMode, "fast blockchain syncing")
 	cmd.Flags().BytesHexVar(
 		&genesisHash,
-		"genesis_hash",
+		"genesis-hash",
 		[]byte{},
-		"Optional SHA-256 hash of the genesis file")
+		"optional SHA-256 hash of the genesis file")
+	cmd.Flags().Int64("consensus.double-sign-check-height", config.Consensus.DoubleSignCheckHeight,
+		"how many blocks to look back to check existence of the node's "+
+			"consensus votes before joining consensus")
 
 	// abci flags
 	cmd.Flags().String(
-		"proxy_app",
+		"proxy-app",
 		config.ProxyApp,
-		"Proxy app address, or one of: 'kvstore',"+
+		"proxy app address, or one of: 'kvstore',"+
 			" 'persistent_kvstore',"+
 			" 'counter',"+
 			" 'counter_serial' or 'noop' for local testing.")
-	cmd.Flags().String("abci", config.ABCI, "Specify abci transport (socket | grpc)")
+	cmd.Flags().String("abci", config.ABCI, "specify abci transport (socket | grpc)")
 
 	// rpc flags
 	cmd.Flags().String("rpc.laddr", config.RPC.ListenAddress, "RPC listen address. Port required")
 	cmd.Flags().String(
-		"rpc.grpc_laddr",
+		"rpc.grpc-laddr",
 		config.RPC.GRPCListenAddress,
 		"GRPC listen address (BroadcastTx only). Port required")
-	cmd.Flags().Bool("rpc.unsafe", config.RPC.Unsafe, "Enabled unsafe rpc methods")
+	cmd.Flags().Bool("rpc.unsafe", config.RPC.Unsafe, "enabled unsafe rpc methods")
+	cmd.Flags().String("rpc.pprof-laddr", config.RPC.PprofListenAddress, "pprof listen address (https://golang.org/pkg/net/http/pprof)")
 
 	// p2p flags
 	cmd.Flags().String(
 		"p2p.laddr",
 		config.P2P.ListenAddress,
-		"Node listen address. (0.0.0.0:0 means any interface, any port)")
-	cmd.Flags().String("p2p.seeds", config.P2P.Seeds, "Comma-delimited ID@host:port seed nodes")
-	cmd.Flags().String("p2p.persistent_peers", config.P2P.PersistentPeers, "Comma-delimited ID@host:port persistent peers")
-	cmd.Flags().String("p2p.unconditional_peer_ids",
-		config.P2P.UnconditionalPeerIDs, "Comma-delimited IDs of unconditional peers")
-	cmd.Flags().Bool("p2p.upnp", config.P2P.UPNP, "Enable/disable UPNP port forwarding")
-	cmd.Flags().Bool("p2p.pex", config.P2P.PexReactor, "Enable/disable Peer-Exchange")
-	cmd.Flags().Bool("p2p.seed_mode", config.P2P.SeedMode, "Enable/disable seed mode")
-	cmd.Flags().String("p2p.private_peer_ids", config.P2P.PrivatePeerIDs, "Comma-delimited private peer IDs")
+		"node listen address. (0.0.0.0:0 means any interface, any port)")
+	cmd.Flags().String("p2p.seeds", config.P2P.Seeds, "comma-delimited ID@host:port seed nodes")
+	cmd.Flags().String("p2p.persistent-peers", config.P2P.PersistentPeers, "comma-delimited ID@host:port persistent peers")
+	cmd.Flags().String("p2p.unconditional-peer-ids",
+		config.P2P.UnconditionalPeerIDs, "comma-delimited IDs of unconditional peers")
+	cmd.Flags().Bool("p2p.upnp", config.P2P.UPNP, "enable/disable UPNP port forwarding")
+	cmd.Flags().Bool("p2p.pex", config.P2P.PexReactor, "enable/disable Peer-Exchange")
+	cmd.Flags().String("p2p.private-peer-ids", config.P2P.PrivatePeerIDs, "comma-delimited private peer IDs")
 
 	// consensus flags
 	cmd.Flags().Bool(
-		"consensus.create_empty_blocks",
+		"consensus.create-empty-blocks",
 		config.Consensus.CreateEmptyBlocks,
-		"Set this to false to only produce blocks when there are txs or when the AppHash changes")
+		"set this to false to only produce blocks when there are txs or when the AppHash changes")
 	cmd.Flags().String(
-		"consensus.create_empty_blocks_interval",
-		string(config.Consensus.CreateEmptyBlocksInterval),
-		"The possible interval between empty blocks")
+		"consensus.create-empty-blocks-interval",
+		config.Consensus.CreateEmptyBlocksInterval.String(),
+		"the possible interval between empty blocks")
 
 	// db flags
 	cmd.Flags().String(
-		"db_backend",
+		"db-backend",
 		config.DBBackend,
-		"Database backend: goleveldb | cleveldb | boltdb | rocksdb")
+		"database backend: goleveldb | cleveldb | boltdb | rocksdb | badgerdb")
 	cmd.Flags().String(
-		"db_dir",
+		"db-dir",
 		config.DBPath,
-		"Database directory")
+		"database directory")
 }
 
 // NewRunNodeCmd returns the command that allows the CLI to start a node.
 // It can be used with a custom PrivValidator and in-process ABCI application.
 func NewRunNodeCmd(nodeProvider nm.Provider) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "node",
-		Short: "Run the tendermint node",
+		Use:     "start",
+		Aliases: []string{"node", "run"},
+		Short:   "Run the tendermint node",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			n, err := nodeProvider(config, logger)
-			if err != nil {
-				return fmt.Errorf("failed to create node: %v", err)
-			}
-
-			// Stop upon receiving SIGTERM or CTRL-C.
-			tmos.TrapSignal(logger, func() {
-				if n.IsRunning() {
-					n.Stop()
-				}
-			})
-
 			if err := checkGenesisHash(config); err != nil {
 				return err
 			}
 
-			if err := n.Start(); err != nil {
-				return fmt.Errorf("failed to start node: %v", err)
+			n, err := nodeProvider(config, logger)
+			if err != nil {
+				return fmt.Errorf("failed to create node: %w", err)
 			}
-			logger.Info("Started node", "nodeInfo", n.Switch().NodeInfo())
+
+			if err := n.Start(); err != nil {
+				return fmt.Errorf("failed to start node: %w", err)
+			}
+
+			logger.Info("Started node", "nodeInfo", n.NodeInfo())
+
+			// Stop upon receiving SIGTERM or CTRL-C.
+			tmos.TrapSignal(logger, func() {
+				if n.IsRunning() {
+					if err := n.Stop(); err != nil {
+						logger.Error("unable to stop the node", "error", err)
+					}
+				}
+			})
 
 			// Run forever.
 			select {}
@@ -137,18 +146,18 @@ func checkGenesisHash(config *cfg.Config) error {
 	// Calculate SHA-256 hash of the genesis file.
 	f, err := os.Open(config.GenesisFile())
 	if err != nil {
-		return errors.Wrap(err, "can't open genesis file")
+		return fmt.Errorf("can't open genesis file: %w", err)
 	}
 	defer f.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return errors.Wrap(err, "error when hashing genesis file")
+		return fmt.Errorf("error when hashing genesis file: %w", err)
 	}
 	actualHash := h.Sum(nil)
 
 	// Compare with the flag.
 	if !bytes.Equal(genesisHash, actualHash) {
-		return errors.Errorf(
+		return fmt.Errorf(
 			"--genesis_hash=%X does not match %s hash: %X",
 			genesisHash, config.GenesisFile(), actualHash)
 	}

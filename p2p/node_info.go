@@ -1,11 +1,12 @@
 package p2p
 
 import (
+	"errors"
 	"fmt"
-	"reflect"
 
 	"github.com/tendermint/tendermint/libs/bytes"
 	tmstrings "github.com/tendermint/tendermint/libs/strings"
+	tmp2p "github.com/tendermint/tendermint/proto/tendermint/p2p"
 	"github.com/tendermint/tendermint/version"
 )
 
@@ -19,34 +20,11 @@ func MaxNodeInfoSize() int {
 	return maxNodeInfoSize
 }
 
-//-------------------------------------------------------------
-
-// NodeInfo exposes basic info of a node
-// and determines if we're compatible.
-type NodeInfo interface {
-	ID() ID
-	nodeInfoAddress
-	nodeInfoTransport
-}
-
-type nodeInfoAddress interface {
-	NetAddress() (*NetAddress, error)
-}
-
-// nodeInfoTransport validates a nodeInfo and checks
-// our compatibility with it. It's for use in the handshake.
-type nodeInfoTransport interface {
-	Validate() error
-	CompatibleWith(other NodeInfo) error
-}
-
-//-------------------------------------------------------------
-
 // ProtocolVersion contains the protocol versions for the software.
 type ProtocolVersion struct {
-	P2P   version.Protocol `json:"p2p"`
-	Block version.Protocol `json:"block"`
-	App   version.Protocol `json:"app"`
+	P2P   uint64 `json:"p2p"`
+	Block uint64 `json:"block"`
+	App   uint64 `json:"app"`
 }
 
 // defaultProtocolVersion populates the Block and P2P versions using
@@ -58,7 +36,7 @@ var defaultProtocolVersion = NewProtocolVersion(
 )
 
 // NewProtocolVersion returns a fully populated ProtocolVersion.
-func NewProtocolVersion(p2p, block, app version.Protocol) ProtocolVersion {
+func NewProtocolVersion(p2p, block, app uint64) ProtocolVersion {
 	return ProtocolVersion{
 		P2P:   p2p,
 		Block: block,
@@ -68,18 +46,14 @@ func NewProtocolVersion(p2p, block, app version.Protocol) ProtocolVersion {
 
 //-------------------------------------------------------------
 
-// Assert DefaultNodeInfo satisfies NodeInfo
-var _ NodeInfo = DefaultNodeInfo{}
-
-// DefaultNodeInfo is the basic node information exchanged
+// NodeInfo is the basic node information exchanged
 // between two peers during the Tendermint P2P handshake.
-type DefaultNodeInfo struct {
+type NodeInfo struct {
 	ProtocolVersion ProtocolVersion `json:"protocol_version"`
 
 	// Authenticate
-	// TODO: replace with NetAddress
-	DefaultNodeID ID     `json:"id"`          // authenticated identifier
-	ListenAddr    string `json:"listen_addr"` // accepting incoming
+	NodeID     NodeID `json:"id"`          // authenticated identifier
+	ListenAddr string `json:"listen_addr"` // accepting incoming
 
 	// Check compatibility.
 	// Channels are HexBytes so easier to read as JSON
@@ -88,22 +62,22 @@ type DefaultNodeInfo struct {
 	Channels bytes.HexBytes `json:"channels"` // channels this node knows about
 
 	// ASCIIText fields
-	Moniker string               `json:"moniker"` // arbitrary moniker
-	Other   DefaultNodeInfoOther `json:"other"`   // other application specific data
+	Moniker string        `json:"moniker"` // arbitrary moniker
+	Other   NodeInfoOther `json:"other"`   // other application specific data
 }
 
-// DefaultNodeInfoOther is the misc. applcation specific data
-type DefaultNodeInfoOther struct {
+// NodeInfoOther is the misc. applcation specific data
+type NodeInfoOther struct {
 	TxIndex    string `json:"tx_index"`
 	RPCAddress string `json:"rpc_address"`
 }
 
 // ID returns the node's peer ID.
-func (info DefaultNodeInfo) ID() ID {
-	return info.DefaultNodeID
+func (info NodeInfo) ID() NodeID {
+	return info.NodeID
 }
 
-// Validate checks the self-reported DefaultNodeInfo is safe.
+// Validate checks the self-reported NodeInfo is safe.
 // It returns an error if there
 // are too many Channels, if there are any duplicate Channels,
 // if the ListenAddr is malformed, or if the ListenAddr is a host name
@@ -116,7 +90,7 @@ func (info DefaultNodeInfo) ID() ID {
 // International clients could then use punycode (or we could use
 // url-encoding), and we just need to be careful with how we handle that in our
 // clients. (e.g. off by default).
-func (info DefaultNodeInfo) Validate() error {
+func (info NodeInfo) Validate() error {
 
 	// ID is already validated.
 
@@ -170,15 +144,10 @@ func (info DefaultNodeInfo) Validate() error {
 	return nil
 }
 
-// CompatibleWith checks if two DefaultNodeInfo are compatible with eachother.
+// CompatibleWith checks if two NodeInfo are compatible with each other.
 // CONTRACT: two nodes are compatible if the Block version and network match
 // and they have at least one channel in common.
-func (info DefaultNodeInfo) CompatibleWith(otherInfo NodeInfo) error {
-	other, ok := otherInfo.(DefaultNodeInfo)
-	if !ok {
-		return fmt.Errorf("wrong NodeInfo type. Expected DefaultNodeInfo, got %v", reflect.TypeOf(otherInfo))
-	}
-
+func (info NodeInfo) CompatibleWith(other NodeInfo) error {
 	if info.ProtocolVersion.Block != other.ProtocolVersion.Block {
 		return fmt.Errorf("peer is on a different Block version. Got %v, expected %v",
 			other.ProtocolVersion.Block, info.ProtocolVersion.Block)
@@ -211,39 +180,59 @@ OUTER_LOOP:
 	return nil
 }
 
-// NetAddress returns a NetAddress derived from the DefaultNodeInfo -
+// NetAddress returns a NetAddress derived from the NodeInfo -
 // it includes the authenticated peer ID and the self-reported
 // ListenAddr. Note that the ListenAddr is not authenticated and
 // may not match that address actually dialed if its an outbound peer.
-func (info DefaultNodeInfo) NetAddress() (*NetAddress, error) {
+func (info NodeInfo) NetAddress() (*NetAddress, error) {
 	idAddr := IDAddressString(info.ID(), info.ListenAddr)
 	return NewNetAddressString(idAddr)
 }
 
-//-----------------------------------------------------------
-// These methods are for Protobuf Compatibility
+func (info NodeInfo) ToProto() *tmp2p.NodeInfo {
 
-// Size returns the size of the amino encoding, in bytes.
-func (info *DefaultNodeInfo) Size() int {
-	bs, _ := info.Marshal()
-	return len(bs)
-}
-
-// Marshal returns the amino encoding.
-func (info *DefaultNodeInfo) Marshal() ([]byte, error) {
-	return cdc.MarshalBinaryBare(info)
-}
-
-// MarshalTo calls Marshal and copies to the given buffer.
-func (info *DefaultNodeInfo) MarshalTo(data []byte) (int, error) {
-	bs, err := info.Marshal()
-	if err != nil {
-		return -1, err
+	dni := new(tmp2p.NodeInfo)
+	dni.ProtocolVersion = tmp2p.ProtocolVersion{
+		P2P:   info.ProtocolVersion.P2P,
+		Block: info.ProtocolVersion.Block,
+		App:   info.ProtocolVersion.App,
 	}
-	return copy(data, bs), nil
+
+	dni.NodeID = string(info.NodeID)
+	dni.ListenAddr = info.ListenAddr
+	dni.Network = info.Network
+	dni.Version = info.Version
+	dni.Channels = info.Channels
+	dni.Moniker = info.Moniker
+	dni.Other = tmp2p.NodeInfoOther{
+		TxIndex:    info.Other.TxIndex,
+		RPCAddress: info.Other.RPCAddress,
+	}
+
+	return dni
 }
 
-// Unmarshal deserializes from amino encoded form.
-func (info *DefaultNodeInfo) Unmarshal(bs []byte) error {
-	return cdc.UnmarshalBinaryBare(bs, info)
+func NodeInfoFromProto(pb *tmp2p.NodeInfo) (NodeInfo, error) {
+	if pb == nil {
+		return NodeInfo{}, errors.New("nil node info")
+	}
+	dni := NodeInfo{
+		ProtocolVersion: ProtocolVersion{
+			P2P:   pb.ProtocolVersion.P2P,
+			Block: pb.ProtocolVersion.Block,
+			App:   pb.ProtocolVersion.App,
+		},
+		NodeID:     NodeID(pb.NodeID),
+		ListenAddr: pb.ListenAddr,
+		Network:    pb.Network,
+		Version:    pb.Version,
+		Channels:   pb.Channels,
+		Moniker:    pb.Moniker,
+		Other: NodeInfoOther{
+			TxIndex:    pb.Other.TxIndex,
+			RPCAddress: pb.Other.RPCAddress,
+		},
+	}
+
+	return dni, nil
 }

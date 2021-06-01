@@ -26,7 +26,7 @@ func TestKeyPath(t *testing.T) {
 					keys[i][j] = alphanum[rand.Intn(len(alphanum))]
 				}
 			case KeyEncodingHex:
-				rand.Read(keys[i]) //nolint: gosec
+				rand.Read(keys[i])
 			default:
 				panic("Unexpected encoding")
 			}
@@ -35,6 +35,7 @@ func TestKeyPath(t *testing.T) {
 
 		res, err := KeyPathToKeys(path.String())
 		require.Nil(t, err)
+		require.Equal(t, len(keys), len(res))
 
 		for i, key := range keys {
 			require.Equal(t, key, res[i])

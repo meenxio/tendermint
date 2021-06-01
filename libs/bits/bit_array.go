@@ -2,13 +2,17 @@ package bits
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"math"
+	mrand "math/rand"
 	"regexp"
 	"strings"
 	"sync"
 
 	tmmath "github.com/tendermint/tendermint/libs/math"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
+	tmprotobits "github.com/tendermint/tendermint/proto/tendermint/libs/bits"
 )
 
 // BitArray is a thread-safe implementation of a bit array.
@@ -21,12 +25,14 @@ type BitArray struct {
 // NewBitArray returns a new bit array.
 // It returns nil if the number of bits is zero.
 func NewBitArray(bits int) *BitArray {
+	// Reseed non-deterministically.
+	tmrand.Reseed()
 	if bits <= 0 {
 		return nil
 	}
 	return &BitArray{
 		Bits:  bits,
-		Elems: make([]uint64, (bits+63)/64),
+		Elems: make([]uint64, numElems(bits)),
 	}
 }
 
@@ -99,7 +105,7 @@ func (bA *BitArray) copy() *BitArray {
 }
 
 func (bA *BitArray) copyBits(bits int) *BitArray {
-	c := make([]uint64, (bits+63)/64)
+	c := make([]uint64, numElems(bits))
 	copy(c, bA.Elems)
 	return &BitArray{
 		Bits:  bits,
@@ -239,7 +245,7 @@ func (bA *BitArray) IsFull() bool {
 
 // PickRandom returns a random index for a set bit in the bit array.
 // If there is no such value, it returns 0, false.
-// It uses the global randomness in `random.go` to get this index.
+// It uses math/rand's global randomness Source to get this index.
 func (bA *BitArray) PickRandom() (int, bool) {
 	if bA == nil {
 		return 0, false
@@ -252,8 +258,8 @@ func (bA *BitArray) PickRandom() (int, bool) {
 	if len(trueIndices) == 0 { // no bits set to true
 		return 0, false
 	}
-
-	return trueIndices[tmrand.Intn(len(trueIndices))], true
+	// nolint:gosec // G404: Use of weak random number generator
+	return trueIndices[mrand.Intn(len(trueIndices))], true
 }
 
 func (bA *BitArray) getTrueIndices() []int {
@@ -354,14 +360,12 @@ func (bA *BitArray) Update(o *BitArray) {
 	if bA == nil || o == nil {
 		return
 	}
+
 	bA.mtx.Lock()
 	o.mtx.Lock()
-	defer func() {
-		bA.mtx.Unlock()
-		o.mtx.Unlock()
-	}()
-
 	copy(bA.Elems, o.Elems)
+	o.mtx.Unlock()
+	bA.mtx.Unlock()
 }
 
 // MarshalJSON implements json.Marshaler interface by marshaling bit array
@@ -417,4 +421,53 @@ func (bA *BitArray) UnmarshalJSON(bz []byte) error {
 	}
 	*bA = *bA2 //nolint:govet
 	return nil
+}
+
+// ToProto converts BitArray to protobuf. It returns nil if BitArray is
+// nil/empty.
+func (bA *BitArray) ToProto() *tmprotobits.BitArray {
+	if bA == nil ||
+		(len(bA.Elems) == 0 && bA.Bits == 0) { // empty
+		return nil
+	}
+
+	bA.mtx.Lock()
+	defer bA.mtx.Unlock()
+
+	bc := bA.copy()
+	return &tmprotobits.BitArray{Bits: int64(bc.Bits), Elems: bc.Elems}
+}
+
+// FromProto sets BitArray to the given protoBitArray. It returns an error if
+// protoBitArray is invalid.
+func (bA *BitArray) FromProto(protoBitArray *tmprotobits.BitArray) error {
+	if protoBitArray == nil {
+		return nil
+	}
+
+	// Validate protoBitArray.
+	if protoBitArray.Bits < 0 {
+		return errors.New("negative Bits")
+	}
+	// #[32bit]
+	if protoBitArray.Bits > math.MaxInt32 { // prevent overflow on 32bit systems
+		return errors.New("too many Bits")
+	}
+	if got, exp := len(protoBitArray.Elems), numElems(int(protoBitArray.Bits)); got != exp {
+		return fmt.Errorf("invalid number of Elems: got %d, but exp %d", got, exp)
+	}
+
+	bA.mtx.Lock()
+	defer bA.mtx.Unlock()
+
+	ec := make([]uint64, len(protoBitArray.Elems))
+	copy(ec, protoBitArray.Elems)
+
+	bA.Bits = int(protoBitArray.Bits)
+	bA.Elems = ec
+	return nil
+}
+
+func numElems(bits int) int {
+	return (bits + 63) / 64
 }
