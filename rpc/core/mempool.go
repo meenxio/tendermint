@@ -7,7 +7,8 @@ import (
 	"time"
 
 	abci "github.com/tendermint/tendermint/abci/types"
-	mempl "github.com/tendermint/tendermint/mempool"
+	mempl "github.com/tendermint/tendermint/internal/mempool"
+	tmpubsub "github.com/tendermint/tendermint/libs/pubsub"
 	ctypes "github.com/tendermint/tendermint/rpc/core/types"
 	rpctypes "github.com/tendermint/tendermint/rpc/jsonrpc/types"
 	"github.com/tendermint/tendermint/types"
@@ -20,11 +21,11 @@ import (
 // CheckTx nor DeliverTx results.
 // More: https://docs.tendermint.com/master/rpc/#/Tx/broadcast_tx_async
 func (env *Environment) BroadcastTxAsync(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
-	err := env.Mempool.CheckTx(tx, nil, mempl.TxInfo{Context: ctx.Context()})
-
+	err := env.Mempool.CheckTx(ctx.Context(), tx, nil, mempl.TxInfo{})
 	if err != nil {
 		return nil, err
 	}
+
 	return &ctypes.ResultBroadcastTx{Hash: tx.Hash()}, nil
 }
 
@@ -33,14 +34,19 @@ func (env *Environment) BroadcastTxAsync(ctx *rpctypes.Context, tx types.Tx) (*c
 // More: https://docs.tendermint.com/master/rpc/#/Tx/broadcast_tx_sync
 func (env *Environment) BroadcastTxSync(ctx *rpctypes.Context, tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
 	resCh := make(chan *abci.Response, 1)
-	err := env.Mempool.CheckTx(tx, func(res *abci.Response) {
-		resCh <- res
-	}, mempl.TxInfo{Context: ctx.Context()})
+	err := env.Mempool.CheckTx(
+		ctx.Context(),
+		tx,
+		func(res *abci.Response) { resCh <- res },
+		mempl.TxInfo{},
+	)
 	if err != nil {
 		return nil, err
 	}
+
 	res := <-resCh
 	r := res.GetCheckTx()
+
 	return &ctypes.ResultBroadcastTx{
 		Code:      r.Code,
 		Data:      r.Data,
@@ -72,22 +78,28 @@ func (env *Environment) BroadcastTxCommit(ctx *rpctypes.Context, tx types.Tx) (*
 		return nil, err
 	}
 	defer func() {
-		if err := env.EventBus.Unsubscribe(context.Background(), subscriber, q); err != nil {
+		args := tmpubsub.UnsubscribeArgs{Subscriber: subscriber, Query: q}
+		if err := env.EventBus.Unsubscribe(context.Background(), args); err != nil {
 			env.Logger.Error("Error unsubscribing from eventBus", "err", err)
 		}
 	}()
 
 	// Broadcast tx and wait for CheckTx result
 	checkTxResCh := make(chan *abci.Response, 1)
-	err = env.Mempool.CheckTx(tx, func(res *abci.Response) {
-		checkTxResCh <- res
-	}, mempl.TxInfo{Context: ctx.Context()})
+	err = env.Mempool.CheckTx(
+		ctx.Context(),
+		tx,
+		func(res *abci.Response) { checkTxResCh <- res },
+		mempl.TxInfo{},
+	)
 	if err != nil {
 		env.Logger.Error("Error on broadcastTxCommit", "err", err)
 		return nil, fmt.Errorf("error on broadcastTxCommit: %v", err)
 	}
+
 	checkTxResMsg := <-checkTxResCh
 	checkTxRes := checkTxResMsg.GetCheckTx()
+
 	if checkTxRes.Code != abci.CodeTypeOK {
 		return &ctypes.ResultBroadcastTxCommit{
 			CheckTx:   *checkTxRes,
@@ -142,7 +154,7 @@ func (env *Environment) UnconfirmedTxs(ctx *rpctypes.Context, limitPtr *int) (*c
 	return &ctypes.ResultUnconfirmedTxs{
 		Count:      len(txs),
 		Total:      env.Mempool.Size(),
-		TotalBytes: env.Mempool.TxsBytes(),
+		TotalBytes: env.Mempool.SizeBytes(),
 		Txs:        txs}, nil
 }
 
@@ -152,7 +164,7 @@ func (env *Environment) NumUnconfirmedTxs(ctx *rpctypes.Context) (*ctypes.Result
 	return &ctypes.ResultUnconfirmedTxs{
 		Count:      env.Mempool.Size(),
 		Total:      env.Mempool.Size(),
-		TotalBytes: env.Mempool.TxsBytes()}, nil
+		TotalBytes: env.Mempool.SizeBytes()}, nil
 }
 
 // CheckTx checks the transaction without executing it. The transaction won't

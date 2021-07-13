@@ -3,8 +3,8 @@ package http_test
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -12,7 +12,6 @@ import (
 	"github.com/tendermint/tendermint/abci/example/kvstore"
 	"github.com/tendermint/tendermint/light/provider"
 	lighthttp "github.com/tendermint/tendermint/light/provider/http"
-	"github.com/tendermint/tendermint/node"
 	rpcclient "github.com/tendermint/tendermint/rpc/client"
 	rpchttp "github.com/tendermint/tendermint/rpc/client/http"
 	rpctest "github.com/tendermint/tendermint/rpc/test"
@@ -33,23 +32,17 @@ func TestNewProvider(t *testing.T) {
 	require.Equal(t, fmt.Sprintf("%s", c), "http{http://153.200.0.1}")
 }
 
-func NodeSuite(t *testing.T) *node.Node {
-	t.Helper()
+func TestProvider(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := rpctest.CreateConfig(t.Name())
 
 	// start a tendermint node in the background to test against
 	app := kvstore.NewApplication()
 	app.RetainBlocks = 9
-	node := rpctest.StartTendermint(app)
-	t.Cleanup(func() {
-		rpctest.StopTendermint(node)
-		os.RemoveAll(node.Config().RootDir)
-	})
-	return node
-}
+	_, closer, err := rpctest.StartTendermint(ctx, cfg, app)
+	require.NoError(t, err)
 
-func TestProvider(t *testing.T) {
-	n := NodeSuite(t)
-	cfg := n.Config()
 	rpcAddr := cfg.RPC.ListenAddress
 	genDoc, err := types.GenesisDocFromFile(cfg.GenesisFile())
 	require.NoError(t, err)
@@ -88,8 +81,9 @@ func TestProvider(t *testing.T) {
 	require.Nil(t, lb)
 	assert.Equal(t, provider.ErrHeightTooHigh, err)
 
-	_, err = p.LightBlock(context.Background(), 1)
+	lb, err = p.LightBlock(context.Background(), 1)
 	require.Error(t, err)
+	require.Nil(t, lb)
 	assert.Equal(t, provider.ErrLightBlockNotFound, err)
 
 	// if the provider is unable to provide four more blocks then we should return
@@ -98,4 +92,15 @@ func TestProvider(t *testing.T) {
 		_, err = p.LightBlock(context.Background(), 1)
 	}
 	assert.IsType(t, provider.ErrUnreliableProvider{}, err)
+
+	// shut down tendermint node
+	require.NoError(t, closer(ctx))
+	cancel()
+
+	time.Sleep(10 * time.Second)
+	lb, err = p.LightBlock(context.Background(), lower+2)
+	// we should see a connection refused
+	require.Error(t, err)
+	require.Nil(t, lb)
+	assert.Equal(t, provider.ErrConnectionClosed, err)
 }

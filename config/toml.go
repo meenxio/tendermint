@@ -280,7 +280,8 @@ laddr = "{{ .P2P.ListenAddress }}"
 # Address to advertise to peers for them to dial
 # If empty, will use the same port as the laddr,
 # and will introspect on the listener or use UPnP
-# to figure out the address.
+# to figure out the address. ip and port are required
+# example: 159.89.10.97:26656
 external-address = "{{ .P2P.ExternalAddress }}"
 
 # Comma separated list of seed nodes to connect to
@@ -363,6 +364,11 @@ dial-timeout = "{{ .P2P.DialTimeout }}"
 #######################################################
 [mempool]
 
+# Mempool version to use:
+#   1) "v0" - The legacy non-prioritized mempool reactor.
+#   2) "v1" (default) - The prioritized mempool reactor.
+version = "{{ .Mempool.Version }}"
+
 recheck = {{ .Mempool.Recheck }}
 broadcast = {{ .Mempool.Broadcast }}
 
@@ -419,6 +425,13 @@ discovery-time = "{{ .StateSync.DiscoveryTime }}"
 # Temporary directory for state sync snapshot chunks, defaults to the OS tempdir (typically /tmp).
 # Will create a new, randomly named directory within, and remove it when done.
 temp-dir = "{{ .StateSync.TempDir }}"
+
+# The timeout duration before re-requesting a chunk, possibly from a different
+# peer (default: 15 seconds).
+chunk-request-timeout = "{{ .StateSync.ChunkRequestTimeout }}"
+
+# The number of concurrent chunk and block fetchers to run (default: 4).
+fetchers = "{{ .StateSync.Fetchers }}"
 
 #######################################################
 ###       Fast Sync Configuration Connections       ###

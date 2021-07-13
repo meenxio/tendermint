@@ -11,8 +11,8 @@ import (
 
 	"github.com/tendermint/tendermint/crypto"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
+	tmtime "github.com/tendermint/tendermint/libs/time"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-	tmtime "github.com/tendermint/tendermint/types/time"
 )
 
 func TestVoteSet_AddVote_Good(t *testing.T) {
@@ -485,6 +485,16 @@ func randVoteSet(
 	votingPower int64,
 ) (*VoteSet, *ValidatorSet, []PrivValidator) {
 	valSet, privValidators := randValidatorPrivValSet(numValidators, votingPower)
+	return NewVoteSet("test_chain_id", height, round, signedMsgType, valSet), valSet, privValidators
+}
+
+func deterministicVoteSet(
+	height int64,
+	round int32,
+	signedMsgType tmproto.SignedMsgType,
+	votingPower int64,
+) (*VoteSet, *ValidatorSet, []PrivValidator) {
+	valSet, privValidators := deterministicValidatorSet()
 	return NewVoteSet("test_chain_id", height, round, signedMsgType, valSet), valSet, privValidators
 }
 
